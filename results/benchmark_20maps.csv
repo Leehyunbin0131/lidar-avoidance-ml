@@ -1,0 +1,7 @@
+model,success_rate_pct,goals,crashes,timeouts,avg_goal_time_s,val_mae,infer_ms
+라이다 회피 기준선,85.0,17,0,3,8.13,-,0.010
+Linear,35.0,7,11,2,4.57,0.0873,0.519
+KNN,60.0,12,7,1,4.94,0.0492,2.057
+RandomForest,90.0,18,2,0,5.02,0.0446,8.182
+MLP (DL),100.0,20,0,0,4.82,0.0561,0.250
+1D CNN (DL),95.0,19,1,0,5.55,0.0471,0.281
