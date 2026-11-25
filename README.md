@@ -15,7 +15,8 @@
 ## 빠른 실행
 
 ```bash
-cd /home/hyunlee/lidar-avoidance-ml
+git clone https://github.com/Leehyunbin0131/lidar-avoidance-ml.git
+cd lidar-avoidance-ml
 uv run python main.py
 ```
 
