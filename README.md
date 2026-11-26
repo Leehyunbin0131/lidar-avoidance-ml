@@ -58,6 +58,7 @@ uv run python main.py
 
 ## 관련 문서
 
+- [docs/study_guide.md](docs/study_guide.md): 데이터 수집·5종 모델·폐루프 평가 학습 가이드 및 발표 Q&A
 - [docs/guide.md](docs/guide.md): 시뮬레이터 원리, 모델별 특징, 평가 결과 해석
 - [docs/prompt_log.md](docs/prompt_log.md): 프로젝트 개발 및 검증 과정의 생성 AI 프롬프트 기록
 - 참고 문헌: Ross et al. (2011), [A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning](https://proceedings.mlr.press/v15/ross11a.html)
