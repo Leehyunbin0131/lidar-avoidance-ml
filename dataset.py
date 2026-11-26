@@ -1,38 +1,52 @@
-"""Dataset storage, goal-aware L/R mirror augmentation, and CSV/NPZ I/O."""
+"""Dataset storage for (28-dim observation, 3-class action) samples, L/R mirror augmentation, and CSV/NPZ I/O."""
 
 from __future__ import annotations
 
 import csv
+import hashlib
+import zipfile
+import zlib
 from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 
-from simulator import MAX_ANGULAR_SPEED, MAX_LINEAR_SPEED, NUM_BEAMS, OBS_DIM
+from simulator import (
+    ACTION_LEFT,
+    ACTION_NAMES,
+    ACTION_RIGHT,
+    ACTION_STRAIGHT,
+    NUM_ACTIONS,
+    NUM_BEAMS,
+    OBS_DIM,
+    validate_action,
+    validate_observation,
+)
+
+__all__ = [
+    "ACTION_LEFT",
+    "ACTION_STRAIGHT",
+    "ACTION_RIGHT",
+    "NUM_ACTIONS",
+    "ACTION_NAMES",
+    "DrivingDataset",
+    "mirror_actions",
+    "mirror_observations",
+]
 
 
-ACTION_LEFT = 0
-ACTION_STRAIGHT = 1
-ACTION_RIGHT = 2
-ACTION_NAMES = ["좌회전 (L)", "직진 (S)", "우회전 (R)"]
+def fingerprint_arrays(x: np.ndarray, y_actions: np.ndarray) -> str:
+    """Order-sensitive SHA-256 hex digest of ``(X_obs[N, obs_dim], y_actions[N])`` as float32 / int64, in order.
 
-
-def velocity_to_action(w: float, threshold: float = 0.28) -> int:
-    """Map angular velocity w (screen coords: <0 left, >0 right) to 3-class label."""
-    if w < -threshold:
-        return ACTION_LEFT
-    if w > threshold:
-        return ACTION_RIGHT
-    return ACTION_STRAIGHT
-
-
-def action_to_velocity(action: int) -> Tuple[float, float]:
-    """Map discrete class index back to (linear_v, angular_w)."""
-    if action == ACTION_LEFT:
-        return MAX_LINEAR_SPEED * 0.72, -MAX_ANGULAR_SPEED * 0.82
-    if action == ACTION_RIGHT:
-        return MAX_LINEAR_SPEED * 0.72, MAX_ANGULAR_SPEED * 0.82
-    return MAX_LINEAR_SPEED * 0.92, 0.0
+    Shared by :meth:`DrivingDataset.fingerprint` and ``model.train_model`` so a model records the digest of the
+    exact arrays it trained on, even if the live dataset changes while training runs.
+    """
+    x = np.asarray(x)
+    h = hashlib.sha256()
+    h.update(np.asarray(x.shape, dtype=np.int64).tobytes())
+    h.update(np.ascontiguousarray(x, dtype=np.float32).tobytes())
+    h.update(np.ascontiguousarray(y_actions, dtype=np.int64).tobytes())
+    return h.hexdigest()
 
 
 def mirror_observations(x: np.ndarray, num_beams: int = NUM_BEAMS) -> np.ndarray:
@@ -45,114 +59,129 @@ def mirror_observations(x: np.ndarray, num_beams: int = NUM_BEAMS) -> np.ndarray
     return x_flip
 
 
+def mirror_actions(y: np.ndarray) -> np.ndarray:
+    """Swap left <-> right action labels (straight unchanged), preserving dtype and shape."""
+    y = np.asarray(y)
+    out = y.copy()
+    out[y == ACTION_LEFT] = ACTION_RIGHT
+    out[y == ACTION_RIGHT] = ACTION_LEFT
+    return out
+
+
 class DrivingDataset:
-    """In-memory buffer + disk persistence for (obs[28], v_norm, w_norm, action) samples."""
+    """In-memory buffer + disk persistence for (obs[28], action) samples."""
 
     def __init__(self, obs_dim: int = OBS_DIM, num_beams: int = NUM_BEAMS):
         self.obs_dim = obs_dim
         self.num_beams = num_beams
         self._obs: list[np.ndarray] = []
-        self._vels: list[Tuple[float, float]] = []
         self._actions: list[int] = []
 
     def __len__(self) -> int:
         return len(self._obs)
 
-    def add(self, obs: np.ndarray, v: float, w: float) -> None:
-        """Add one sample (ignores stationary frames automatically)."""
-        if abs(v) < 1e-3 and abs(w) < 1e-3:
-            return
-        arr = np.asarray(obs, dtype=np.float32).copy()
-        if arr.shape != (self.obs_dim,):
-            return
+    def add(self, obs: np.ndarray, action: int) -> None:
+        """Add one (observation, action) sample. Callers decide which frames to record.
+
+        ``obs`` must be a finite 1D array of shape ``(obs_dim,)`` and ``action`` an integer ID in {0, 1, 2};
+        anything else raises ValueError and leaves the buffer unchanged.
+        """
+        arr = validate_observation(obs, self.obs_dim).copy()
+        a = validate_action(action)
         self._obs.append(arr)
-        self._vels.append((float(v / MAX_LINEAR_SPEED), float(w / MAX_ANGULAR_SPEED)))
-        self._actions.append(velocity_to_action(w))
+        self._actions.append(a)
 
     def clear(self) -> None:
         self._obs.clear()
-        self._vels.clear()
         self._actions.clear()
+
+    def snapshot(self) -> "DrivingDataset":
+        """Independent copy of the current samples, safe to hand to a background job."""
+        clone = DrivingDataset(obs_dim=self.obs_dim, num_beams=self.num_beams)
+        x, y_act = self.to_arrays()
+        clone._obs = [row for row in x]  # rows are views into a freshly stacked copy
+        clone._actions = [int(a) for a in y_act]
+        return clone
 
     def class_counts(self) -> Tuple[int, int, int]:
         if not self._actions:
             return (0, 0, 0)
-        arr = np.array(self._actions, dtype=np.int64)
-        return (
-            int(np.sum(arr == ACTION_LEFT)),
-            int(np.sum(arr == ACTION_STRAIGHT)),
-            int(np.sum(arr == ACTION_RIGHT)),
-        )
+        counts = np.bincount(np.array(self._actions, dtype=np.int64), minlength=NUM_ACTIONS)
+        return (int(counts[ACTION_LEFT]), int(counts[ACTION_STRAIGHT]), int(counts[ACTION_RIGHT]))
 
-    def to_arrays(
-        self, mirror_augment: bool = False
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return (X_obs, y_vels_norm, y_actions)."""
+    def fingerprint(self) -> str:
+        """Order-sensitive SHA-256 hex digest of the samples (float32 observations, int64 actions, in order).
+
+        Two datasets share a fingerprint only when they hold the same rows in the same order, so a reordering
+        that keeps the size and class counts still changes it (the 20% validation split depends on row order).
+        """
+        return fingerprint_arrays(*self.to_arrays())
+
+    def to_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (X_obs[N, obs_dim] float32, y_actions[N] int64)."""
         if len(self) == 0:
-            return (
-                np.empty((0, self.obs_dim), dtype=np.float32),
-                np.empty((0, 2), dtype=np.float32),
-                np.empty((0,), dtype=np.int64),
-            )
-
+            return np.empty((0, self.obs_dim), dtype=np.float32), np.empty((0,), dtype=np.int64)
         x = np.stack(self._obs, axis=0).astype(np.float32)
-        y_vel = np.array(self._vels, dtype=np.float32)
         y_act = np.array(self._actions, dtype=np.int64)
-
-        if mirror_augment:
-            x_flip = mirror_observations(x, num_beams=self.num_beams)
-            y_vel_flip = y_vel.copy()
-            y_vel_flip[:, 1] = -y_vel_flip[:, 1]
-            y_act_flip = np.where(
-                y_act == ACTION_LEFT,
-                ACTION_RIGHT,
-                np.where(y_act == ACTION_RIGHT, ACTION_LEFT, ACTION_STRAIGHT),
-            )
-            x = np.concatenate([x, x_flip], axis=0)
-            y_vel = np.concatenate([y_vel, y_vel_flip], axis=0)
-            y_act = np.concatenate([y_act, y_act_flip], axis=0)
-
-        return x, y_vel, y_act
+        return x, y_act
 
     def save(self, npz_path: Path, export_csv: bool = True) -> int:
-        """Save dataset to .npz (and optional .csv for easy inspection)."""
+        """Save dataset to .npz (keys: obs, actions) and an optional .csv for easy inspection."""
         npz_path.parent.mkdir(parents=True, exist_ok=True)
-        x, y_vel, y_act = self.to_arrays(mirror_augment=False)
-        np.savez_compressed(npz_path, obs=x, vels=y_vel, actions=y_act)
+        x, y_act = self.to_arrays()
+        np.savez_compressed(npz_path, obs=x, actions=y_act)
 
-        if export_csv and len(x) > 0:
+        if export_csv:
+            # Always rewrite the CSV (header only when empty) so it never keeps stale rows from an older save.
             csv_path = npz_path.with_suffix(".csv")
             header = (
                 [f"beam_{i}" for i in range(self.num_beams)]
-                + ["goal_sin", "goal_cos", "goal_dist", "v_norm", "w_norm", "action"]
+                + ["goal_sin", "goal_cos", "goal_dist", "action"]
             )
             with csv_path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(header)
                 for i in range(len(x)):
-                    row = [f"{val:.4f}" for val in x[i]] + [
-                        f"{y_vel[i, 0]:.4f}",
-                        f"{y_vel[i, 1]:.4f}",
-                        int(y_act[i]),
-                    ]
-                    writer.writerow(row)
+                    writer.writerow([f"{val:.4f}" for val in x[i]] + [int(y_act[i])])
         return len(x)
 
     def load(self, npz_path: Path) -> int:
-        """Load dataset from .npz file (only if feature dimension matches current OBS_DIM)."""
+        """Load dataset from .npz (only if the feature dimension matches and action labels exist).
+
+        Older files may also carry a ``vels`` array; it is ignored.
+        """
         if not npz_path.exists():
             return 0
-        data = np.load(npz_path)
-        key = "obs" if "obs" in data else "scans"
-        x = data[key].astype(np.float32)
-        if x.ndim != 2 or x.shape[1] != self.obs_dim:
+        # Pickled (object-dtype) arrays stay disabled; unreadable / truncated / non-NPZ files load nothing and
+        # leave the in-memory buffer untouched (it is only replaced after every check below has passed).
+        try:
+            with npz_path.open("rb") as fh:  # our handle, so it is closed even when np.load fails midway
+                data = np.load(fh, allow_pickle=False)
+                if not hasattr(data, "files"):  # a bare .npy array, not an NPZ archive
+                    return 0
+                with data:
+                    key = "obs" if "obs" in data.files else "scans"
+                    if key not in data.files or "actions" not in data.files:
+                        return 0
+                    raw_x = np.asarray(data[key])
+                    raw_y = np.asarray(data["actions"])
+        except (ValueError, OSError, EOFError, KeyError, zipfile.BadZipFile, zlib.error):  # zlib: bad deflate data
             return 0
-        y_vel = data["vels"].astype(np.float32)
-        y_act = data["actions"].astype(np.int64)
+        # Only real-valued observations and integer action IDs are accepted; bool, float (even integral)
+        # and string action arrays are rejected instead of being truncated into different labels.
+        if raw_x.dtype.kind not in "fiu" or raw_y.dtype.kind not in "iu":
+            return 0
+        x = raw_x.astype(np.float32)
+        y_act = raw_y.reshape(-1)
+        if x.ndim != 2 or x.shape[1] != self.obs_dim or len(x) != len(y_act):
+            return 0
+        if not np.all(np.isfinite(x)):
+            return 0
+        if len(y_act) and (y_act.min() < 0 or y_act.max() >= NUM_ACTIONS):
+            return 0
+        y_act = y_act.astype(np.int64)
 
         self.clear()
-        for i in range(len(x)):
-            self._obs.append(x[i])
-            self._vels.append((float(y_vel[i, 0]), float(y_vel[i, 1])))
-            self._actions.append(int(y_act[i]))
+        self._obs.extend(x[i] for i in range(len(x)))
+        self._actions.extend(int(a) for a in y_act)
         return len(self)

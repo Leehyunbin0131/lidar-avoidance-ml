@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -125,18 +126,26 @@ def detect_hardware() -> HardwareInfo:
 
 
 class OpenVINORunner:
-    """Compiled OpenVINO InferRequest wrapper for fast CPU / GPU / Intel NPU inference."""
+    """Compiled OpenVINO InferRequest wrapper for fast CPU / GPU / Intel NPU inference.
+
+    One InferRequest cannot run two inferences at once ("Infer Request is busy"), so ``predict`` serializes
+    callers with a per-runner lock; the UI race, a benchmark thread, and latency probes can share a runner.
+    """
 
     def __init__(self, compiled_model, device: str, compile_ms: float):
         self.compiled_model = compiled_model
         self.device = device
         self.compile_ms = compile_ms
         self.infer_request = compiled_model.create_infer_request()
+        self._lock = threading.Lock()
 
     def predict(self, x_np: np.ndarray) -> np.ndarray:
-        """Run inference on shape (1, obs_dim) float32 numpy array."""
-        res = self.infer_request.infer({0: x_np})
-        return np.asarray(res[0], dtype=np.float32)
+        """Run inference on a (1, obs_dim) float32 array; returns raw action logits of shape (1, 3)."""
+        x = np.ascontiguousarray(x_np, dtype=np.float32)
+        with self._lock:
+            res = self.infer_request.infer({0: x})
+            # Copy while holding the lock: the output tensor is reused by the next inference.
+            return np.array(res[0], dtype=np.float32, copy=True)
 
 
 def compile_torch_to_openvino(
@@ -151,26 +160,27 @@ def compile_torch_to_openvino(
     core = _get_ov_core()
     assert core is not None
 
-    # Ensure model is on CPU in eval mode for tracing/conversion
+    # Tracing/conversion needs the model on CPU in eval mode. Remember where it lived so that every exit path,
+    # including a failed conversion / IR save / compile, moves it back (a CUDA model is never left on CPU).
     orig_device = next(net.parameters()).device
-    net_cpu = net.to("cpu").eval()
-    dummy = torch.zeros(1, obs_dim, dtype=torch.float32)
+    try:
+        net_cpu = net.to("cpu").eval()
+        dummy = torch.zeros(1, obs_dim, dtype=torch.float32)
 
-    t0 = time.perf_counter()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ov_model = ov.convert_model(net_cpu, example_input=dummy, input=([1, obs_dim], ov.Type.f32))
+        t0 = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ov_model = ov.convert_model(net_cpu, example_input=dummy, input=([1, obs_dim], ov.Type.f32))
 
-    if export_xml_path is not None:
-        export_xml_path.parent.mkdir(parents=True, exist_ok=True)
-        ov.save_model(ov_model, str(export_xml_path))
+        if export_xml_path is not None:
+            export_xml_path.parent.mkdir(parents=True, exist_ok=True)
+            ov.save_model(ov_model, str(export_xml_path))
 
-    compiled = core.compile_model(ov_model, ov_device)
-    compile_ms = (time.perf_counter() - t0) * 1000.0
-
-    # Restore original device if it was on CUDA
-    if orig_device.type != "cpu":
-        net.to(orig_device)
+        compiled = core.compile_model(ov_model, ov_device)
+        compile_ms = (time.perf_counter() - t0) * 1000.0
+    finally:
+        if orig_device.type != "cpu":
+            net.to(orig_device)
 
     return OpenVINORunner(compiled_model=compiled, device=ov_device, compile_ms=compile_ms)
 

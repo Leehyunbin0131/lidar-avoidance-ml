@@ -17,7 +17,7 @@ import pygame
 from PIL import GifImagePlugin, Image, ImageSequence
 
 import ui_kit as ui
-from model import BASELINE_LABEL, LEGACY_BASELINE_LABEL, BenchmarkEntry, MODEL_LABELS, TaskType
+from model import BASELINE_LABEL, LEGACY_BASELINE_LABEL, BenchmarkEntry, MODEL_LABELS
 from simulator import WORLD_HEIGHT, WORLD_WIDTH
 
 
@@ -31,7 +31,7 @@ class Chapter:
 
 CHAPTERS = (
     Chapter("지도와 센서", "벽 앞에서 전체 지도를 볼 때와 현재 거리만 잴 때, 각각 어디까지 알 수 있을까요?", "collect", "데이터 수집 화면 열기"),
-    Chapter("주행 기록과 모방학습", "라이다가 잰 거리와 로봇의 회전 명령 중 어느 쪽이 입력이고 어느 쪽이 예측값일까요?", "collect", "데이터 수집 화면 열기"),
+    Chapter("주행 기록과 모방학습", "라이다가 잰 거리와 로봇이 고른 행동(좌·직·우) 중 어느 쪽이 입력이고 어느 쪽이 예측값일까요?", "collect", "데이터 수집 화면 열기"),
     Chapter("다섯 모델의 차이", "통로 입구가 센서 빔 한 칸만큼 옆으로 옮겨지면 어떤 모델이 비슷한 모양을 알아보기 쉬울까요?", "train", "학습 화면에서 모델 비교하기"),
     Chapter("실험 결과 읽기", "도착 횟수가 같다면 검증 점수와 충돌 횟수도 같을까요?", "test", "레이스와 20맵 평가 열기"),
     Chapter("실제 로봇으로 이어 보기", "벽 앞에서 늦게 돈다면 거리 측정·모델 계산·바퀴 반응 중 어디에서 시간이 걸렸을까요?", "test", "단일 주행에서 예측값 보기"),
@@ -45,7 +45,6 @@ _BASELINE_LABELS = (BASELINE_LABEL, LEGACY_BASELINE_LABEL)
 
 @dataclass(frozen=True)
 class Report:
-    task: TaskType
     entries: tuple[BenchmarkEntry, ...]
     source: str
 
@@ -57,10 +56,9 @@ def read_saved_report(path: Path) -> Optional[Report]:
         with path.open(encoding="utf-8-sig", newline="") as stream:
             reader = csv.DictReader(stream)
             fields = reader.fieldnames or []
-            metrics = [m for m in ("val_acc_pct", "val_mae") if m in fields]
-            if len(metrics) != 1:
-                return None
-            metric = metrics[0]
+            metric = "val_acc_pct"
+            if metric not in fields:
+                return None  # Only accuracy-based (classification) exports are understood.
             rows = []
             for raw in reader:
                 key = keys[raw["model"]]
@@ -78,7 +76,7 @@ def read_saved_report(path: Path) -> Optional[Report]:
         return None
     if not rows or not any(r.key == "baseline" for r in rows):
         return None
-    return Report("classification" if metric == "val_acc_pct" else "regression", tuple(rows), "저장된 평가")
+    return Report(tuple(rows), "저장된 평가")
 
 
 GUIDE_PATH = Path(__file__).resolve().parent / "docs" / "guide.md"
@@ -119,14 +117,14 @@ def _outcome_sentence(name: str, r: BenchmarkEntry) -> str:
     if goals == r.num_maps:
         return f"{topic} 모두에서 도착했습니다."
     if goals == 0 and crashes == 0:
-        return f"{topic} 모두에서 충돌하지 않았지만 제한 시간 안에 도착하지 못했습니다."
+        return f"{topic} 모두에서 충돌하지 않았으나 제한 시간 안에 도착하지 못했습니다."
     head = f"{topic} 중 {goals}개에서 도착했고" if goals else f"{topic} 중 한 곳에도 도착하지 못했고"
     rest = "나머지 " if goals else ""
     if crashes == 0:
-        return f"{head} 한 번도 충돌하지 않았지만, {rest}{timeouts}개에서는 제한 시간 안에 도착하지 못했습니다."
+        return f"{head} 한 번도 충돌하지 않았으나 {rest}{timeouts}개에서는 제한 시간 안에 도착하지 못했습니다."
     if timeouts == 0:
-        return f"{head}, {rest}{crashes}개에서 충돌했습니다."
-    return f"{head}, {crashes}개에서 충돌했으며 {timeouts}개에서는 제한 시간 안에 도착하지 못했습니다."
+        return f"{head} {rest}{crashes}개에서 충돌했습니다."
+    return f"{head} {crashes}개에서 충돌했으며 {timeouts}개에서는 제한 시간 안에 도착하지 못했습니다."
 
 
 def result_markdown(report: Optional[Report]) -> str:
@@ -134,13 +132,12 @@ def result_markdown(report: Optional[Report]) -> str:
         return "아직 평가 기록이 없습니다. 레이스 탭에서 ‘20맵 평가 실행’을 누르면 이 자리에 도착·충돌·시간 초과 횟수와 해석이 표시됩니다."
     rows = report.entries
     n = rows[0].num_maps
-    cls = report.task == "classification"
-    metric = "검증 정확도" if cls else "검증 MAE"
-    lines = [f"### {report.source} · {'분류' if cls else '회귀'} · 같은 맵 {n}개", "",
+    metric = "검증 정확도"
+    lines = [f"### {report.source} · 같은 맵 {n}개", "",
              f"| 주행 방식 | {metric} | 도착 | 충돌 | 시간 초과 | 도달률 |",
              "| --- | --- | --- | --- | --- | --- |"]
     for r in rows:
-        val = "—" if r.val_metric is None else (f"{r.val_metric:.1f}%" if cls else f"{r.val_metric:.4f}")
+        val = "—" if r.val_metric is None else f"{r.val_metric:.1f}%"
         lines.append(f"| {_row_name(r)} | {val} | {r.goals}/{n} | {r.crashes} | {r.timeouts} | {r.success_rate:.0f}% |")
     base = next(r for r in rows if r.key == "baseline")
     learned = [r for r in rows if r.key != "baseline"]
@@ -153,11 +150,11 @@ def result_markdown(report: Optional[Report]) -> str:
         if len(leaders) > 1 and all(r.val_metric is not None for r in leaders):
             a, b = min(leaders, key=lambda r: r.val_metric), max(leaders, key=lambda r: r.val_metric)
             if a.val_metric != b.val_metric:
-                a_val = f"{a.val_metric:.1f}%" if cls else f"{a.val_metric:.4f}"
-                b_val = f"{b.val_metric:.1f}%" if cls else f"{b.val_metric:.4f}"
+                a_val = f"{a.val_metric:.1f}%"
+                b_val = f"{b.val_metric:.1f}%"
                 pair = f"{a_val}{_josa(a_val, '과', '와')} {b_val}"
                 end = _josa(b_val, "이었지만", "였지만")
-                lines[-1] += f" {a.label}{_josa(a.label, '과', '와')} {b.label}의 {metric}는 각각 {pair}{end}, 완주한 맵 수는 같았습니다."
+                lines[-1] += f" {a.label}{_josa(a.label, '과', '와')} {b.label}의 {metric}는 각각 {pair}{end} 완주한 맵 수는 같았습니다."
     else:
         lines[-1] += " 모델을 학습한 뒤 다시 평가하면 기준선과 비교할 수 있습니다."
     lines[-1] += f" 이번 평가에서 도착 한 번은 도달률 {100 / n:g}%p에 해당합니다."

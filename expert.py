@@ -7,6 +7,10 @@ Teacher-Student (Privileged Imitation Learning) Paradigm:
   - Baseline (hand-written, no learning): a map-free reactive Artificial Potential Field controller
     that reads the exact same 28-dim observation as the students (goal attraction + local LiDAR
     repulsion). It is the non-learned reference the trained models are compared against.
+
+Every policy outside this module speaks the same 3-class action interface (0=Left, 1=Straight, 2=Right).
+The teacher and baseline compute a continuous steering command internally; ``steer_to_action``
+turns that command into the action label that is recorded or executed.
 """
 
 from __future__ import annotations
@@ -19,6 +23,9 @@ import numpy as np
 
 from dataset import DrivingDataset
 from simulator import (
+    ACTION_LEFT,
+    ACTION_RIGHT,
+    ACTION_STRAIGHT,
     FOV_RAD,
     MAX_ANGULAR_SPEED,
     MAX_GOAL_DIST_NORM,
@@ -33,10 +40,20 @@ from simulator import (
     RobotState,
     Simulator,
     generate_random_map,
+    validate_observation,
 )
 
 
-def baseline_control(obs: np.ndarray, num_beams: int = NUM_BEAMS) -> Tuple[float, float]:
+def steer_to_action(w: float, threshold: float = 0.28) -> int:
+    """Map a steering rate w (screen coords: <0 left, >0 right) to the 3-class action label."""
+    if w < -threshold:
+        return ACTION_LEFT
+    if w > threshold:
+        return ACTION_RIGHT
+    return ACTION_STRAIGHT
+
+
+def _apf_command(obs: np.ndarray, num_beams: int = NUM_BEAMS) -> Tuple[float, float]:
     """Map-free reactive baseline (Artificial Potential Field): steer toward goal and away from close LiDAR returns.
 
     Uses only the same observation the ML students see (``num_beams`` normalized LiDAR ranges followed by
@@ -73,6 +90,18 @@ def baseline_control(obs: np.ndarray, num_beams: int = NUM_BEAMS) -> Tuple[float
     clear = max(0.0, min(1.0, (front - 0.07) / 0.35))
     v = 0.85 * MAX_LINEAR_SPEED * clear * max(0.25, math.cos(heading))
     return v, w
+
+
+def baseline_action(obs: np.ndarray, num_beams: int = NUM_BEAMS) -> int:
+    """Discrete action chosen by the map-free LiDAR avoidance baseline for one observation.
+
+    ``obs`` must be a finite 1D array of exactly ``num_beams + 3`` values; malformed or non-finite
+    observations raise ValueError instead of silently becoming a driving command.
+    """
+    if num_beams <= 0:
+        raise ValueError("num_beams must be positive")
+    arr = validate_observation(obs, num_beams + 3)
+    return steer_to_action(_apf_command(arr, num_beams)[1])
 
 
 class AStarTeacher:
@@ -217,10 +246,10 @@ class AStarTeacher:
         self.path = pts
         return self.path
 
-    def control(self, agent: RobotState, beam_offsets: np.ndarray) -> Tuple[float, float]:
+    def _command(self, agent: RobotState, beam_offsets: np.ndarray) -> Tuple[float, float]:
         """Pure Pursuit tracking along the precomputed A* global path + close-range safety guard."""
         if not self.path:
-            return baseline_control(agent.last_obs, num_beams=len(beam_offsets))
+            return _apf_command(agent.last_obs, num_beams=len(beam_offsets))
 
         # Find closest waypoint along path, then advance to lookahead distance
         dists = [math.hypot(px - agent.x, py - agent.y) for px, py in self.path]
@@ -255,6 +284,12 @@ class AStarTeacher:
         clear_factor = float(np.clip((front_min - 0.06) / 0.30, 0.35, 1.0))
         v = MAX_LINEAR_SPEED * 0.92 * min(turn_factor, clear_factor)
         return v, w
+
+    def drive(self, sim: Simulator, agent: RobotState, dt: float, add_noise: bool = True) -> int:
+        """Track the planned path for one physics step and return the demonstrated action label."""
+        v, w = self._command(agent, sim.beam_offsets)
+        sim.step_agent(agent, v, w, dt, add_noise=add_noise)
+        return steer_to_action(w)
 
 
 def generate_expert_dataset(
@@ -293,10 +328,8 @@ def generate_expert_dataset(
 
     while added < num_samples and total_steps < safety_limit:
         total_steps += 1
-        obs = sim.robot.last_obs.copy()
-        v, w = teacher.control(sim.robot, sim.beam_offsets)
-
-        sim.step_agent(sim.robot, v, w, dt, add_noise=True)
+        obs = sim.get_observation().copy()
+        action = teacher.drive(sim, sim.robot, dt)
         ep_steps += 1
 
         if sim.robot.collided:
@@ -305,7 +338,7 @@ def generate_expert_dataset(
             next_episode()
             continue
 
-        dataset.add(obs, v, w)
+        dataset.add(obs, action)
         added += 1
 
         if sim.robot.reached_goal:

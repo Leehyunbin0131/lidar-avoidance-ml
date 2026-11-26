@@ -25,8 +25,65 @@ MAX_GOAL_DIST_NORM = 700.0
 
 ROBOT_RADIUS = 16.0
 GOAL_RADIUS = 30.0
-MAX_LINEAR_SPEED = 200.0  # px/s
-MAX_ANGULAR_SPEED = 2.9   # rad/s
+MAX_LINEAR_SPEED = 200.0  # px/s  (internal physics limit)
+MAX_ANGULAR_SPEED = 2.9   # rad/s (internal physics limit)
+
+# Discrete driving actions: the only interface between policies (baseline, models, keyboard) and physics.
+ACTION_LEFT = 0
+ACTION_STRAIGHT = 1
+ACTION_RIGHT = 2
+NUM_ACTIONS = 3
+ACTION_NAMES: Tuple[str, str, str] = ("좌회전", "직진", "우회전")
+
+
+
+def validate_action(action: object) -> int:
+    """Return ``action`` as a plain int if it is an integer action ID in {0, 1, 2}, else raise ValueError.
+
+    Only ``int`` / ``np.integer`` values are accepted: booleans, floats (even ``1.0``), strings and other
+    types are rejected so that a fractional or truthy value can never silently become a driving label.
+    """
+    if isinstance(action, (bool, np.bool_)) or not isinstance(action, (int, np.integer)):
+        raise ValueError(f"invalid action {action!r}; expected an integer in 0..{NUM_ACTIONS - 1}")
+    value = int(action)
+    if not 0 <= value < NUM_ACTIONS:
+        raise ValueError(f"invalid action {action!r}; expected an integer in 0..{NUM_ACTIONS - 1}")
+    return value
+
+
+def validate_observation(obs: object, dim: int = OBS_DIM) -> np.ndarray:
+    """Return ``obs`` as a float32 array of exact shape ``(dim,)`` with only finite values, else raise ValueError.
+
+    Batches such as ``(1, dim)`` / ``(N, dim)``, wrong lengths, and NaN / Inf entries are all rejected. The
+    dtype is checked *before* any cast: complex (even with a zero imaginary part), boolean, string and object
+    inputs raise instead of being silently coerced to float32.
+    """
+    try:
+        raw = np.asarray(obs)
+    except (TypeError, ValueError):
+        raise ValueError(f"observation is not numeric: {type(obs).__name__}") from None
+    if np.iscomplexobj(raw):
+        raise ValueError("observation must be real-valued, got a complex array")
+    if raw.dtype == np.bool_:
+        raise ValueError("observation must be numeric, got a boolean array")
+    if raw.dtype.kind not in "fiu":
+        raise ValueError(f"observation is not numeric: dtype {raw.dtype}")
+    if raw.shape != (dim,):
+        raise ValueError(f"observation shape {raw.shape} != ({dim},)")
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("observation contains NaN or Inf values")
+    arr = raw.astype(np.float32)
+    if not np.all(np.isfinite(arr)):  # e.g. float64 1e300 overflows float32
+        raise ValueError("observation values overflow float32")
+    return arr
+
+
+# Fixed (v, w) physics command executed for each action (screen coords: w < 0 turns left).
+_ACTION_COMMANDS = {
+    ACTION_LEFT: (0.72 * MAX_LINEAR_SPEED, -0.82 * MAX_ANGULAR_SPEED),
+    ACTION_STRAIGHT: (0.92 * MAX_LINEAR_SPEED, 0.0),
+    ACTION_RIGHT: (0.72 * MAX_LINEAR_SPEED, 0.82 * MAX_ANGULAR_SPEED),
+}
 
 
 @dataclass
@@ -408,35 +465,27 @@ class Simulator:
 
         self.observe_agent(agent, add_noise=add_noise)
 
-    def step(self, v: float, w: float, dt: float) -> Tuple[bool, bool, float]:
-        """Step the primary robot (allows continuing after wall bump in manual mode)."""
-        prev_d = self.robot.distance
-        v = float(np.clip(v, -MAX_LINEAR_SPEED * 0.5, MAX_LINEAR_SPEED))
-        w = float(np.clip(w, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
-
-        self.robot.v = v
-        self.robot.w = w
-        self.robot.elapsed += dt
-        self.robot.theta = (self.robot.theta + w * dt + math.pi) % (2.0 * math.pi) - math.pi
-
-        nx = self.robot.x + v * math.cos(self.robot.theta) * dt
-        ny = self.robot.y + v * math.sin(self.robot.theta) * dt
-
-        if self.check_collision(nx, ny):
-            self.robot.collided = True
+    def step_action(self, agent: RobotState, action: Optional[int], dt: float, add_noise: bool = True) -> None:
+        """Advance ``agent`` by dt seconds executing a discrete action (``None`` = stand still)."""
+        if action is None:
+            v, w = 0.0, 0.0
         else:
-            moved = math.hypot(nx - self.robot.x, ny - self.robot.y)
-            self.robot.x = nx
-            self.robot.y = ny
-            self.robot.distance += moved
-            self.robot.collided = False
-            if not self.robot.trail or math.hypot(nx - self.robot.trail[-1][0], ny - self.robot.trail[-1][1]) > 5.0:
-                self.robot.trail.append((nx, ny))
-                if len(self.robot.trail) > 500:
-                    self.robot.trail.pop(0)
-            self.robot.reached_goal = self.check_goal_reached(nx, ny)
+            v, w = _ACTION_COMMANDS[validate_action(action)]
+        self.step_agent(agent, v, w, dt, add_noise=add_noise)
 
-        self.observe_agent(self.robot, add_noise=True)
+    def get_observation(self) -> np.ndarray:
+        """Latest 28-dim observation of the primary robot."""
+        return self.robot.last_obs
+
+    def step(self, action: Optional[int], dt: float) -> Tuple[bool, bool, float]:
+        """Step the primary robot with a discrete action (a wall bump is non-terminal in manual mode)."""
+        prev_d = self.robot.distance
+        # Manual driving may continue after bumping into a wall or passing through the goal area.
+        self.robot.collided = False
+        self.robot.reached_goal = False
+        self.step_action(self.robot, action, dt, add_noise=True)
+        if self.robot.collided:
+            self.robot.reached_goal = self.check_goal_reached(self.robot.x, self.robot.y)
         return self.robot.collided, self.robot.reached_goal, self.robot.distance - prev_d
 
     def observe_agent(self, agent: RobotState, add_noise: bool = True) -> np.ndarray:

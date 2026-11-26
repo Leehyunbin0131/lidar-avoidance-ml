@@ -5,46 +5,46 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
+import numpy as np
 import pygame
 
 import ui_kit as ui
 from interpretation import CHAPTERS, GuideReader, Report, read_saved_report
 
 from accelerator import BACKEND_LABELS, InferBackend, detect_hardware
-from dataset import ACTION_NAMES, DrivingDataset
-from expert import AStarTeacher, baseline_control, generate_expert_dataset
+from dataset import ACTION_LEFT, ACTION_NAMES, ACTION_RIGHT, ACTION_STRAIGHT, NUM_ACTIONS, DrivingDataset
+from expert import AStarTeacher, baseline_action, generate_expert_dataset
 from model import (
     BASELINE_LABEL,
     MODEL_LABELS,
     MODEL_TYPES,
     BenchmarkEntry,
     ModelType,
-    TaskType,
     TrainedModel,
     TrainHistory,
     checkpoint_path_for,
     evaluate_models_on_random_maps,
     export_benchmark_csv,
-    load_checkpoint,
-    predict_command,
+    load_checkpoint_with_fallback,
+    predict_action,
     prepare_infer_backend,
     train_model,
 )
 from simulator import (
     GOAL_RADIUS,
-    MAX_ANGULAR_SPEED,
     MAX_LIDAR_RANGE,
-    MAX_LINEAR_SPEED,
     ROBOT_RADIUS,
     WALL_MARGIN,
     WORLD_HEIGHT,
     WORLD_WIDTH,
     RobotState,
     Simulator,
+    validate_observation,
 )
 from visualizer import (
     CHART_CHOICES,
@@ -58,7 +58,7 @@ PANEL_WIDTH = 600
 LOGICAL_WIDTH = WORLD_WIDTH + PANEL_WIDTH  # 1680
 LOGICAL_HEIGHT = WORLD_HEIGHT              # 960
 FPS = 60
-RECORD_HZ = 15.0
+RECORD_HZ = 20.0
 RACE_TIMEOUT_SEC = 18.0
 BENCH_SEED_START = 1000  # Seeds 1000..1019 are reserved for the 20-map benchmark (unseen maps).
 BENCH_NUM_MAPS = 20
@@ -123,13 +123,21 @@ def columns(x: int, y: int, w: int, h: int, count: int, gap: int = 8) -> List[py
     return rects
 
 
+def _actual_torch_backend(tm: TrainedModel) -> InferBackend:
+    """Backend a PyTorch model really runs on: its OpenVINO runner if one is compiled, else its tensor device."""
+    ab = tm.active_infer_backend
+    if ab.startswith("ov_") and ab.split("_", 1)[1].upper() in tm.ov_runners:
+        return ab
+    return "torch_cuda" if next(tm.estimator.parameters()).device.type == "cuda" else "torch_cpu"
+
+
 @dataclass
 class RaceContender:
     key: str
     label: str
     tag: str
     color: Tuple[int, int, int]
-    model: Optional[TrainedModel]  # None => map-free LiDAR avoidance baseline (expert.baseline_control)
+    model: Optional[TrainedModel]  # None => map-free LiDAR avoidance baseline (expert.baseline_action)
     state: RobotState
 
 
@@ -179,7 +187,10 @@ class LidarPipelineApp:
         self.random_map_counter = LIVE_MAP_SEED_START - 1
 
         if DATA_PATH.exists():
-            self.dataset.load(DATA_PATH)
+            try:
+                self.dataset.load(DATA_PATH)  # incompatible / corrupt files load nothing (returns 0)
+            except Exception:  # pragma: no cover - defensive: a bad data file must never block startup
+                self.dataset.clear()
 
         # Pipeline navigation
         self.tab = "collect"
@@ -189,8 +200,7 @@ class LidarPipelineApp:
         self.expert_live = False
         self._record_accum = 0.0
 
-        # Train state (default to regression -> smoother, stronger model contrast)
-        self.task_type: TaskType = "regression"
+        # Train state (every model is a 3-class Left / Straight / Right action classifier)
         self.selected_model_type: ModelType = "cnn1d"
         self.mirror_augment = True
         self.class_balance = True
@@ -205,16 +215,26 @@ class LidarPipelineApp:
         self.train_current_model: Optional[ModelType] = None
         self.train_overall_start: float = 0.0
         self.train_stage: str = ""
+        # Finished-training results queued by the worker thread and applied only on the UI thread (_update).
+        self._train_updates: Deque[Tuple[str, Dict[str, Any]]] = deque()
+        self._train_updates_lock = threading.Lock()
+        self._train_thread: Optional[threading.Thread] = None
+        self._train_backend_warnings: List[str] = []
 
-        self.trained_models: Dict[Tuple[ModelType, TaskType], TrainedModel] = {}
+        self.trained_models: Dict[ModelType, TrainedModel] = {}
         self.active_model: Optional[TrainedModel] = None
+        self.model_load_errors: List[str] = []
 
         # Test / Race state
         self.test_mode = "race"  # "race" (6 models simultaneously) | "single"
         self.race_running = False
         self.race_contenders: List[RaceContender] = []
+        self.race_rebuild_pending = False  # models changed during a race; the next start rebuilds contenders
         self.single_running = False
         self.single_model_key: str = "baseline"  # "baseline" or ModelType
+        # Driver bound when a single run starts; retraining never swaps it mid-run (None = baseline).
+        self.single_driver_key: str = "baseline"
+        self.single_driver: Optional[TrainedModel] = None
         self.last_pred_info: Dict[str, object] = {}
 
         # 20-Random-Map Quantitative Benchmark state
@@ -229,7 +249,6 @@ class LidarPipelineApp:
         self.viz_model: ModelType = "mlp"
         self.viz_elev: float = 24.0
         self.viz_azim: float = 42.0
-        self.viz_color_continuous: bool = False
         self.viz_surface: Optional[pygame.Surface] = None
         self.viz_lock = threading.Lock()
         self.is_rendering_viz = False
@@ -248,27 +267,37 @@ class LidarPipelineApp:
         return self.epochs_choices[self.epochs_idx]
 
     def _autoload_saved_models(self) -> None:
+        """Load every model's canonical checkpoint, falling back to the legacy ``_cls`` file if it fails.
+
+        Load failures are kept in ``model_load_errors`` and surfaced in the status bar instead of being dropped.
+        """
+        self.model_load_errors = []
         if not MODELS_DIR.exists():
             return
-        for t_type in ("regression", "classification"):
-            for m_type in MODEL_TYPES:
-                p = checkpoint_path_for(MODELS_DIR, m_type, t_type)  # type: ignore[arg-type]
-                if p.exists():
-                    try:
-                        tm = load_checkpoint(p)
-                        self.trained_models[(tm.model_type, tm.task_type)] = tm
-                        if self.active_model is None:
-                            self.active_model = tm
-                            self.selected_model_type = tm.model_type
-                            self.task_type = tm.task_type
-                            self.single_model_key = tm.model_type
-                    except Exception:
-                        pass
+        for m_type in MODEL_TYPES:
+            # Each candidate must hold exactly ``m_type`` and pass a finite 28-feature dry-run prediction.
+            tm, errors = load_checkpoint_with_fallback(MODELS_DIR, m_type)
+            self.model_load_errors.extend(errors)
+            if tm is None:
+                continue
+            self.trained_models[m_type] = tm
+            if self.active_model is None:
+                self.active_model = tm
+                self.selected_model_type = m_type
+                self.single_model_key = m_type
+        if self.model_load_errors:
+            names = ", ".join(err.split(":", 1)[0] for err in self.model_load_errors)
+            self.set_status(f"체크포인트 불러오기 실패 {len(self.model_load_errors)}건: {names}", ACCENT_YELLOW)
 
     def set_status(self, msg: str, color: Tuple[int, int, int] = TEXT_MUTED) -> None:
         self.status_page = 0
         self.status_msg = msg
         self.status_color = color
+
+    @property
+    def infer_switching(self) -> bool:
+        """True while DL models are being compiled / moved to another inference backend."""
+        return self.is_compiling_hw
 
     # ------------------------------------------------------------------
     # Viewport / Mouse Coordinate Mapping
@@ -441,7 +470,7 @@ class LidarPipelineApp:
         self._reset_race()
 
     def _reset_race(self) -> None:
-        """Build 6 simultaneous contenders: LiDAR avoidance baseline + every trained model for current task."""
+        """Build 6 simultaneous contenders: LiDAR avoidance baseline + every trained model."""
         contenders: List[RaceContender] = [
             RaceContender(
                 key="baseline",
@@ -453,7 +482,7 @@ class LidarPipelineApp:
             )
         ]
         for m_type in MODEL_TYPES:
-            tm = self.trained_models.get((m_type, self.task_type))
+            tm = self.trained_models.get(m_type)
             if tm is not None:
                 contenders.append(
                     RaceContender(
@@ -466,8 +495,27 @@ class LidarPipelineApp:
                     )
                 )
         self.race_contenders = contenders
+        self.race_rebuild_pending = False
+
+    @property
+    def test_start_blocked(self) -> bool:
+        """A race / single run may not start while another job drives the same models (shared OpenVINO runners)."""
+        return self.is_benchmarking or self.is_compiling_hw
+
+    def _reset_race_unless_running(self) -> None:
+        """Rebuild contenders now unless a race is in progress; that race keeps its robots and clocks, and the
+        next start (which always calls ``_reset_race``) picks up newly trained models."""
+        if self.race_running:
+            self.race_rebuild_pending = True
+        else:
+            self._reset_race()
 
     def _toggle_test_run(self) -> None:
+        running = self.race_running if self.test_mode == "race" else self.single_running
+        if not running and self.test_start_blocked:
+            job = "20맵 평가" if self.is_benchmarking else "추론 장치 전환"
+            self.set_status(f"{job}이 끝난 뒤에 주행을 시작할 수 있습니다.", ACCENT_YELLOW)
+            return
         if self.test_mode == "race":
             if not self.race_running:
                 self._reset_race()
@@ -482,11 +530,12 @@ class LidarPipelineApp:
                 self.set_status("레이스를 중지했습니다. 다시 시작하면 출발 위치로 돌아갑니다.")
         else:
             if not self.single_running:
-                if self.single_model_key != "baseline" and (self.single_model_key, self.task_type) not in self.trained_models:
+                if self.single_model_key != "baseline" and self.single_model_key not in self.trained_models:
                     self.set_status("선택된 모델이 아직 학습되지 않았습니다.", ACCENT_YELLOW)
                     return
                 if self.sim.robot.collided or self.sim.robot.reached_goal:
                     self.sim.reset_robot()
+                self._bind_single_driver()
                 self.single_running = True
                 if self.single_model_key == "baseline":
                     self.set_status(f"{BASELINE_LABEL} 단일 주행 시작", ACCENT_GREEN)
@@ -495,6 +544,13 @@ class LidarPipelineApp:
             else:
                 self.single_running = False
                 self.set_status("단일 자율주행 정지.")
+
+    def _bind_single_driver(self) -> None:
+        """Bind the selected single-run driver; it stays fixed until the run is restarted or re-picked."""
+        self.single_driver_key = self.single_model_key
+        self.single_driver = (
+            None if self.single_model_key == "baseline" else self.trained_models.get(self.single_model_key)  # type: ignore[arg-type]
+        )
 
     def _run_fast_auto_collect(self) -> None:
         self.recording = False
@@ -508,6 +564,9 @@ class LidarPipelineApp:
     def _start_training(self, train_all: bool = False) -> None:
         if self.is_training or self.is_benchmarking:
             return
+        if self.infer_switching:
+            self.set_status("추론 장치 전환이 끝난 뒤에 학습을 시작할 수 있습니다.", ACCENT_YELLOW)
+            return
         if len(self.dataset) < 20:
             self.set_status(f"데이터가 부족합니다 (현재 {len(self.dataset)}개, 최소 20개 필요).", ACCENT_YELLOW)
             return
@@ -516,12 +575,13 @@ class LidarPipelineApp:
         self.race_running = False
         self.single_running = False
         targets: Tuple[ModelType, ...] = MODEL_TYPES if train_all else (self.selected_model_type,)
-        task_type = self.task_type
         epochs = self.epochs
         mirror = self.mirror_augment
         balance = self.class_balance
         train_dev = self.train_device
         infer_be = self.infer_backend
+        # Immutable copy: Collect-tab edits (clear / load / new samples) never reach the running job.
+        dataset_snap = self.dataset.snapshot()
 
         with self.train_lock:
             self.train_queue = list(targets)
@@ -529,8 +589,16 @@ class LidarPipelineApp:
             self.train_current_model = targets[0]
             self.train_overall_start = time.perf_counter()
             self.train_stage = "준비 중..."
+            self.train_history = None
+        with self._train_updates_lock:
+            self._train_updates.clear()
+
+        post = self._post_training_update
 
         def worker() -> None:
+            # Runs off the UI thread: it only touches its own new models and the lock-protected progress fields
+            # (train_current_model / train_stage / train_history). Everything the UI, race or single run reads
+            # is queued through ``post`` and applied by ``_apply_training_updates`` on the UI thread.
             def on_epoch(hist: TrainHistory) -> None:
                 with self.train_lock:
                     self.train_history = hist
@@ -539,8 +607,8 @@ class LidarPipelineApp:
                     else:
                         self.train_stage = "검증 완료"
 
+            error: Optional[str] = None
             try:
-                last_trained: Optional[TrainedModel] = None
                 for idx, m_type in enumerate(targets):
                     m_label = MODEL_LABELS[m_type]
                     prefix = f"[{idx + 1}/{len(targets)}] " if train_all else ""
@@ -551,16 +619,14 @@ class LidarPipelineApp:
                         # Clear previous chart curve so each sequential model draws cleanly
                         self.train_history = TrainHistory(
                             model_type=m_type,
-                            task_type=task_type,
                             total_epochs=epochs if m_type in ("mlp", "cnn1d") else 1,
                         )
-                    self.set_status(f"{prefix}{m_label}{dev_tag} 순차 학습 진행 중...", ACCENT_CYAN)
+                    post("status", msg=f"{prefix}{m_label}{dev_tag} 순차 학습 진행 중...", color=ACCENT_CYAN)
 
-                    save_path = checkpoint_path_for(MODELS_DIR, m_type, task_type)
+                    save_path = checkpoint_path_for(MODELS_DIR, m_type)
                     trained, hist = train_model(
-                        dataset=self.dataset,
+                        dataset=dataset_snap,
                         model_type=m_type,
-                        task_type=task_type,
                         epochs=epochs,
                         mirror_augment=mirror,
                         class_balance=balance,
@@ -568,62 +634,126 @@ class LidarPipelineApp:
                         save_path=save_path,
                         on_epoch=on_epoch,
                     )
+                    backend_error: Optional[str] = None
                     if trained.backend == "torch" and infer_be != trained.active_infer_backend:
                         with self.train_lock:
                             self.train_stage = f"{BACKEND_LABELS[infer_be]} 컴파일 중..."
                         try:
                             prepare_infer_backend(trained, infer_be, export_dir=MODELS_DIR)
-                        except Exception:
-                            pass
-                    with self.train_lock:
-                        self.trained_models[(m_type, task_type)] = trained
-                        self.train_history = hist
-                        self.train_done_set.add(m_type)
-                        last_trained = trained
+                        except Exception as exc:
+                            backend_error = str(exc) or type(exc).__name__
+                            # Record what really executes now (prepare_infer_backend may have failed midway).
+                            trained.active_infer_backend = _actual_torch_backend(trained)
+                    post("model", model_type=m_type, trained=trained, history=hist,
+                         requested_backend=infer_be, backend_error=backend_error)
                     # Short visual beat in batch mode so each sequential completion is clearly visible
                     if train_all and idx < len(targets) - 1:
                         time.sleep(0.12)
-
-                if train_all:
-                    best_tm = self._best_model_for_task(task_type)
-                    if best_tm is not None:
-                        self.active_model = best_tm
-                        self.selected_model_type = best_tm.model_type
-                        self.single_model_key = best_tm.model_type
-                    self._reset_race()
-                    total_sec = time.perf_counter() - self.train_overall_start
-                    self.set_status(
-                        f"5종 순차 학습 완료! (총 {total_sec:.1f}s) → [3. 레이스/평가]에서 비교하세요!",
-                        ACCENT_GREEN,
-                    )
-                elif last_trained is not None:
-                    self.active_model = last_trained
-                    self.single_model_key = last_trained.model_type
-                    self._reset_race()
-                    m_str = (
-                        f"Acc {last_trained.val_metric:.1f}%"
-                        if task_type == "classification"
-                        else f"MAE {last_trained.val_metric:.4f}"
-                    )
-                    self.set_status(f"{MODEL_LABELS[last_trained.model_type]} 학습 완료! ({m_str})", ACCENT_GREEN)
             except Exception as exc:
-                self.set_status(f"학습 오류: {exc}", ACCENT_RED)
+                error = str(exc) or type(exc).__name__
             finally:
-                with self.train_lock:
-                    self.train_current_model = None
-                    self.train_stage = ""
-                self.is_training = False
+                post("done", train_all=train_all, error=error,
+                     total_sec=time.perf_counter() - self.train_overall_start)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._train_thread = threading.Thread(target=worker, daemon=True)
+        self._train_thread.start()
+
+    def _post_training_update(self, kind: str, **payload: Any) -> None:
+        """Worker side: queue a training result for the UI thread."""
+        with self._train_updates_lock:
+            self._train_updates.append((kind, payload))
+
+    def _apply_training_updates(self) -> None:
+        """UI-thread side: apply queued training results (models, history, backend warnings, final status).
+
+        A race in progress keeps its contenders and clocks (``race_rebuild_pending`` makes the next start pick up
+        the new models) and an active single run keeps its bound driver, robot and clock.
+        """
+        with self._train_updates_lock:
+            updates = list(self._train_updates)
+            self._train_updates.clear()
+        for kind, data in updates:
+            if kind == "status":
+                self.set_status(data["msg"], data["color"])
+            elif kind == "model":
+                m_type: ModelType = data["model_type"]
+                trained: TrainedModel = data["trained"]
+                self.trained_models[m_type] = trained
+                with self.train_lock:
+                    # A completion drained late (the worker has already moved on to the next model) must not
+                    # revert the live chart to the finished model's curve.
+                    if not self.is_training or self.train_current_model == m_type:
+                        self.train_history = data["history"]
+                    self.train_done_set.add(m_type)
+                if data["backend_error"] is not None:
+                    self._train_backend_warnings.append(self._backend_fallback_note(trained, data))
+                    self._reconcile_infer_backend(trained)
+            elif kind == "done":
+                self._finish_training(data)
+
+    @staticmethod
+    def _backend_fallback_note(trained: TrainedModel, data: Dict[str, Any]) -> str:
+        return (
+            f"{SHORT_MODEL_LABELS[trained.model_type]}: {BACKEND_LABELS[data['requested_backend']]} 준비 실패"
+            f"({data['backend_error']}) → [{BACKEND_LABELS[trained.active_infer_backend]}]로 실행"
+        )
+
+    def _reconcile_infer_backend(self, trained: TrainedModel) -> None:
+        """Keep the selected backend label truthful: follow the fallback when no DL model runs on it any more."""
+        torch_models = [tm for tm in self.trained_models.values() if tm.backend == "torch"]
+        if all(tm.active_infer_backend != self.infer_backend for tm in torch_models):
+            self.infer_backend = trained.active_infer_backend
+
+    def _finish_training(self, data: Dict[str, Any]) -> None:
+        warnings_note = ""
+        if self._train_backend_warnings:
+            warnings_note = " · 추론 장치 경고: " + " / ".join(self._train_backend_warnings)
+        self._train_backend_warnings = []
+        with self.train_lock:
+            done = [m for m in self.train_queue if m in self.train_done_set]
+            self.train_current_model = None
+            self.train_stage = ""
+        self.is_training = False
+        self._train_thread = None
+
+        if data["error"] is not None:
+            self._reset_race_unless_running()
+            self.set_status(f"학습 오류: {data['error']}{warnings_note}", ACCENT_RED)
+            return
+        if not done:
+            return
+        if data["train_all"]:
+            best_tm = self._best_model()
+        else:
+            best_tm = self.trained_models.get(done[-1])
+        if best_tm is not None:
+            self.active_model = best_tm
+            self.selected_model_type = best_tm.model_type
+            if not self.single_running:  # never retarget an active single run; it ends or restarts first
+                self.single_model_key = best_tm.model_type
+        self._reset_race_unless_running()
+        color = ACCENT_YELLOW if warnings_note else ACCENT_GREEN
+        if data["train_all"]:
+            self.set_status(
+                f"5종 순차 학습 완료! (총 {data['total_sec']:.1f}s) → [3. 레이스/평가]에서 비교하세요!{warnings_note}",
+                color,
+            )
+        elif best_tm is not None:
+            self.set_status(
+                f"{MODEL_LABELS[best_tm.model_type]} 학습 완료! (검증 정확도 {best_tm.val_metric:.1f}%){warnings_note}",
+                color,
+            )
 
     def _start_20map_benchmark(self) -> None:
         if self.is_benchmarking or self.is_training:
+            return
+        if self.infer_switching:
+            self.set_status("추론 장치 전환이 끝난 뒤에 20맵 평가를 시작할 수 있습니다.", ACCENT_YELLOW)
             return
         self.bench_progress = (0, 20 * len(self.race_contenders), "")
         self.is_benchmarking = True
         self.race_running = False
         self.single_running = False
-        task_type = self.task_type
         models_snap = dict(self.trained_models)
         self.set_status(f"랜덤 맵 20개에서 {BASELINE_LABEL}과 학습 모델을 평가합니다.", ACCENT_CYAN)
 
@@ -634,14 +764,13 @@ class LidarPipelineApp:
             try:
                 results = evaluate_models_on_random_maps(
                     trained_models=models_snap,
-                    task_type=task_type,
                     num_maps=BENCH_NUM_MAPS,
                     seed_start=BENCH_SEED_START,
                     on_progress=on_prog,
                 )
                 self.bench_results = results
-                self.guide_report = Report(task_type, tuple(results), "이번 실행의 평가")
-                export_benchmark_csv(results, BENCH_CSV_PATH, task_type)
+                self.guide_report = Report(tuple(results), "이번 실행의 평가")
+                export_benchmark_csv(results, BENCH_CSV_PATH)
                 base = results[0]
                 learned = results[1:]
                 if learned:
@@ -657,24 +786,17 @@ class LidarPipelineApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _best_model_for_task(self, task_type: TaskType) -> Optional[TrainedModel]:
-        candidates = [self.trained_models[(model, task_type)] for model in MODEL_TYPES
-                      if (model, task_type) in self.trained_models]
-        if not candidates:
-            return None
-        if task_type == "classification":
-            return max(candidates, key=lambda m: m.val_metric)
-        return min(candidates, key=lambda m: m.val_metric)
+    def _best_model(self) -> Optional[TrainedModel]:
+        """Trained model with the highest validation accuracy."""
+        candidates = [self.trained_models[model] for model in MODEL_TYPES if model in self.trained_models]
+        return max(candidates, key=lambda m: m.val_metric) if candidates else None
 
     def _switch_infer_backend(self, backend: InferBackend) -> None:
         if self.is_compiling_hw or self.is_training or self.is_benchmarking:
             return
+        prev_backend = self.infer_backend
         self.infer_backend = backend
-        torch_models = [
-            tm
-            for (_, tt), tm in self.trained_models.items()
-            if tt == self.task_type and tm.backend == "torch"
-        ]
+        torch_models = [tm for tm in self.trained_models.values() if tm.backend == "torch"]
         if not torch_models:
             self.set_status(
                 f"DL 추론 가속기 [{BACKEND_LABELS[backend]}] 선택됨 (MLP/1D CNN 학습 시 자동 적용)",
@@ -687,10 +809,12 @@ class LidarPipelineApp:
         self.single_running = False
         self.set_status(f"[{BACKEND_LABELS[backend]}] 디바이스로 DL 모델 컴파일 중...", ACCENT_YELLOW)
 
+        previous = [(tm, tm.active_infer_backend) for tm in torch_models]
+
         def worker() -> None:
             try:
                 lat_parts = []
-                for tm in torch_models:
+                for tm, _ in previous:
                     prepare_infer_backend(tm, backend, export_dir=MODELS_DIR)
                     lat_parts.append(f"{SHORT_MODEL_LABELS[tm.model_type]} {tm.infer_ms:.2f}ms")
                 extra = " (OpenVINO IR 저장됨)" if backend.startswith("ov_") else ""
@@ -699,20 +823,30 @@ class LidarPipelineApp:
                     ACCENT_GREEN,
                 )
             except Exception as exc:
-                self.set_status(f"가속기 전환 오류: {exc}", ACCENT_RED)
-                self.infer_backend = "torch_cpu"
+                # Roll every model (including the one that failed mid-switch) back to the backend it ran on,
+                # so the selected backend label always matches what actually executes.
+                restored = prev_backend
+                try:
+                    for tm, old_backend in reversed(previous):
+                        if tm.active_infer_backend != old_backend:
+                            prepare_infer_backend(tm, old_backend, export_dir=MODELS_DIR)
+                except Exception:  # pragma: no cover - previous accelerator vanished; PyTorch CPU always works
+                    restored = "torch_cpu"
+                    for tm, _ in previous:
+                        prepare_infer_backend(tm, "torch_cpu")
+                self.infer_backend = restored
+                self.set_status(
+                    f"가속기 전환 오류: {exc} → [{BACKEND_LABELS[self.infer_backend]}] 유지",
+                    ACCENT_RED,
+                )
             finally:
                 self.is_compiling_hw = False
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _viz_model_choices(self) -> Tuple[ModelType, ...]:
-        if self.viz_chart == "regression":
-            return tuple(model for model in MODEL_TYPES if (model, "regression") in self.trained_models)
         if self.viz_chart == "classification":
-            preferred = tuple(model for model in MODEL_TYPES if (model, self.task_type) in self.trained_models)
-            return preferred or tuple(model for model in MODEL_TYPES
-                                      if any((model, task) in self.trained_models for task in ("classification", "regression")))
+            return tuple(model for model in MODEL_TYPES if model in self.trained_models)
         return MODEL_TYPES
 
     def _refresh_viz(self) -> None:
@@ -724,25 +858,22 @@ class LidarPipelineApp:
         self.is_rendering_viz = True
         chart = self.viz_chart
         m_type = self.viz_model
-        t_type = self.task_type
         elev = self.viz_elev
         azim = self.viz_azim
-        cont_col = self.viz_color_continuous
         models_snap = dict(self.trained_models)
         bench_snap = list(self.bench_results)
+        dataset_snap = self.dataset.snapshot()
 
         def worker() -> None:
             try:
                 fig = build_figure(
                     chart_type=chart,
-                    dataset=self.dataset,
+                    dataset=dataset_snap,
                     trained_models=models_snap,
                     selected_model=m_type,
-                    task_type=t_type,
                     bench_results=bench_snap,
                     elev=elev,
                     azim=azim,
-                    color_by_continuous=cont_col,
                 )
                 surf = figure_to_pygame_surface(fig, size=(WORLD_WIDTH, WORLD_HEIGHT))
                 with self.viz_lock:
@@ -760,12 +891,11 @@ class LidarPipelineApp:
         self.is_rendering_viz = True
         charts = [c for c, _ in CHART_CHOICES] if export_all else [self.viz_chart]
         m_type = self.viz_model
-        t_type = self.task_type
         elev = self.viz_elev
         azim = self.viz_azim
-        cont_col = self.viz_color_continuous
         models_snap = dict(self.trained_models)
         bench_snap = list(self.bench_results)
+        dataset_snap = self.dataset.snapshot()
         self.set_status("고해상도 PNG 그래프 저장 중...", ACCENT_CYAN)
 
         def worker() -> None:
@@ -774,16 +904,14 @@ class LidarPipelineApp:
                 for ch in charts:
                     fig = build_figure(
                         chart_type=ch,
-                        dataset=self.dataset,
+                        dataset=dataset_snap,
                         trained_models=models_snap,
                         selected_model=m_type,
-                        task_type=t_type,
                         bench_results=bench_snap,
                         elev=elev,
                         azim=azim,
-                        color_by_continuous=cont_col,
                     )
-                    out_p = PLOTS_DIR / f"{ch}_{m_type}_{t_type}.png"
+                    out_p = PLOTS_DIR / f"{ch}_{m_type}.png"
                     save_figure_png(fig, out_p, dpi=160)
                     saved_paths.append(out_p)
                 if export_all:
@@ -833,7 +961,7 @@ class LidarPipelineApp:
             self.recording = self.expert_live or not self.recording
             self.expert_live = False
             self.set_status(
-                "수동 주행 데이터를 수집하고 있습니다. W/A/S/D로 로봇을 조종하세요." if self.recording else "수동 주행 데이터 수집을 중지했습니다.",
+                "수동 주행 데이터를 수집하고 있습니다. W(직진)·A(좌회전)·D(우회전) 또는 방향키로 로봇을 조종하세요." if self.recording else "수동 주행 데이터 수집을 중지했습니다.",
                 ACCENT_RED if self.recording else TEXT_MUTED,
             )
         elif key == "auto_fast":
@@ -844,7 +972,7 @@ class LidarPipelineApp:
             if self.expert_live:
                 self.teacher.plan(self.sim.current_map, start=(self.sim.robot.x, self.sim.robot.y))
             self.set_status(
-                "데이터셋 자동 생성 중입니다. A* 경로를 따라 달리며 관측과 주행 명령을 추가합니다." if self.expert_live else "데이터셋 자동 생성을 중지했습니다.",
+                "데이터셋 자동 생성 중입니다. A* 경로를 따라 달리며 관측과 행동(좌·직·우)을 추가합니다." if self.expert_live else "데이터셋 자동 생성을 중지했습니다.",
                 ACCENT_CYAN if self.expert_live else TEXT_MUTED,
             )
         elif key == "save_data":
@@ -859,16 +987,6 @@ class LidarPipelineApp:
         elif key == "clear_data":
             self.dataset.clear()
             self.set_status("현재 데이터셋의 샘플을 비웠습니다.", ACCENT_YELLOW)
-        elif key in ("task_reg", "task_cls"):
-            task = "regression" if key == "task_reg" else "classification"
-            if task == self.task_type:
-                return
-            self.task_type = task
-            self.last_pred_info = {}
-            if self.single_model_key != "baseline" and (self.single_model_key, task) not in self.trained_models:
-                self.single_model_key = "baseline"
-            self.bench_results = []
-            self._reset_race()
         elif key.startswith("mtype_"):
             self.selected_model_type = key[6:]  # type: ignore[assignment]
         elif key == "train_settings":
@@ -906,6 +1024,7 @@ class LidarPipelineApp:
             self.last_pred_info = {}
             self.single_model_key = key[12:]
             self.sim.reset_robot()
+            self._bind_single_driver()  # explicit re-pick restarts the run from spawn with the new driver
             if self.single_model_key == "baseline":
                 self.set_status(f"단일 주행에서 {BASELINE_LABEL}을 선택했습니다.", ACCENT_CYAN)
             else:
@@ -914,7 +1033,7 @@ class LidarPipelineApp:
             self._start_20map_benchmark()
         elif key == "export_bench":
             if self.bench_results:
-                export_benchmark_csv(self.bench_results, BENCH_CSV_PATH, self.task_type)
+                export_benchmark_csv(self.bench_results, BENCH_CSV_PATH)
                 self.set_status(f"리포트 저장 완료: results/{BENCH_CSV_PATH.name}", ACCENT_GREEN)
         elif key.startswith("viz_chart_"):
             self.viz_chart = key[10:]  # type: ignore[assignment]
@@ -934,9 +1053,6 @@ class LidarPipelineApp:
         elif key == "viz_rot_down":
             self.viz_elev = max(-60.0, self.viz_elev - 15.0)
             self._refresh_viz()
-        elif key == "viz_toggle_color":
-            self.viz_color_continuous = not self.viz_color_continuous
-            self._refresh_viz()
         elif key == "viz_refresh":
             self._refresh_viz()
         elif key == "viz_save_one":
@@ -947,23 +1063,43 @@ class LidarPipelineApp:
     # ------------------------------------------------------------------
     # Simulation Update
     # ------------------------------------------------------------------
-    def _read_manual_control(self) -> Tuple[float, float]:
+    def _read_manual_action(self) -> Optional[int]:
+        """Keyboard -> action: A/← left, D/→ right (exactly one pressed), else W/↑ straight, else None."""
         keys = pygame.key.get_pressed()
-        v = 0.0
-        w = 0.0
+        left = bool(keys[pygame.K_a] or keys[pygame.K_LEFT])
+        right = bool(keys[pygame.K_d] or keys[pygame.K_RIGHT])
+        if left != right:
+            return ACTION_LEFT if left else ACTION_RIGHT
         if keys[pygame.K_w] or keys[pygame.K_UP]:
-            v += MAX_LINEAR_SPEED * 0.90
-        if keys[pygame.K_s] or keys[pygame.K_DOWN]:
-            v -= MAX_LINEAR_SPEED * 0.45
-        if keys[pygame.K_a] or keys[pygame.K_LEFT]:
-            w -= MAX_ANGULAR_SPEED * 0.85
-        if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-            w += MAX_ANGULAR_SPEED * 0.85
-        if abs(v) < 1e-3 and abs(w) > 1e-3:
-            v = MAX_LINEAR_SPEED * 0.35
-        return v, w
+            return ACTION_STRAIGHT
+        return None
+
+    @staticmethod
+    def _policy_action(model: Optional[TrainedModel], obs: np.ndarray) -> Tuple[Optional[int], Optional[np.ndarray]]:
+        """(action, probs) of the baseline (``model=None``) or a trained model; (None, None) on an invalid observation.
+
+        ``None`` makes ``step_action`` hold the robot still instead of driving on a malformed scan.
+        """
+        try:
+            if model is None:
+                action = baseline_action(obs)
+                return action, np.eye(NUM_ACTIONS, dtype=np.float32)[action]
+            return predict_action(model, obs)
+        except ValueError:
+            return None, None
+
+    def _hold_invalid_frame(self, exc: ValueError) -> None:
+        """Skip an invalid observation frame during collection: no step, no sample, a handled status message.
+
+        The robot stays where it is, but its LiDAR scan is re-taken at that pose so a transient bad frame
+        (e.g. one NaN in ``last_obs``) clears and collection resumes on the next valid frame.
+        """
+        self._record_accum = 0.0
+        self.sim.observe_agent(self.sim.robot, add_noise=False)
+        self.set_status(f"잘못된 관측값 프레임을 건너뛰었습니다 (로봇 정지, 기록 안 함): {exc}", ACCENT_YELLOW)
 
     def _update(self, dt: float) -> None:
+        self._apply_training_updates()
         if self.tab == "guide":
             return
         if self.tab == "test":
@@ -974,11 +1110,8 @@ class LidarPipelineApp:
                     if st.collided or st.reached_goal or st.elapsed >= RACE_TIMEOUT_SEC:
                         continue
                     any_active = True
-                    if cont.model is None:
-                        v, w = baseline_control(st.last_obs)
-                    else:
-                        v, w, _ = predict_command(cont.model, st.last_obs)
-                    self.sim.step_agent(st, v, w, dt, add_noise=False)
+                    action, _ = self._policy_action(cont.model, st.last_obs)
+                    self.sim.step_action(st, action, dt, add_noise=False)
                 if not any_active:
                     self.race_running = False
                     winners = [c for c in self.race_contenders if c.state.reached_goal]
@@ -994,17 +1127,13 @@ class LidarPipelineApp:
             elif self.test_mode == "single" and self.single_running:
                 ag = self.sim.robot
                 if not ag.collided and not ag.reached_goal:
-                    if self.single_model_key == "baseline":
-                        v, w = baseline_control(ag.last_obs)
-                        self.last_pred_info = {"task": "regression", "v_norm": v / MAX_LINEAR_SPEED, "w_norm": w / MAX_ANGULAR_SPEED}
-                    else:
-                        tm = self.trained_models.get((self.single_model_key, self.task_type))  # type: ignore[arg-type]
-                        if tm is None:
-                            self.single_running = False
-                            return
-                        v, w, info = predict_command(tm, ag.last_obs)
-                        self.last_pred_info = info
-                    self.sim.step_agent(ag, v, w, dt, add_noise=False)
+                    tm = self.single_driver  # bound at start; retraining never swaps it mid-run
+                    if self.single_driver_key != "baseline" and tm is None:
+                        self.single_running = False
+                        return
+                    action, probs = self._policy_action(tm, ag.last_obs)
+                    self.last_pred_info = {} if action is None else {"action": action, "probs": probs}
+                    self.sim.step_action(ag, action, dt, add_noise=False)
                     if ag.reached_goal:
                         self.single_running = False
                         self.set_status(f"목적지 도달 성공!! ({ag.elapsed:.2f}초)", ACCENT_GREEN)
@@ -1014,25 +1143,35 @@ class LidarPipelineApp:
             return
 
         if self.tab == "collect" and self.expert_live:
-            obs = self.sim.robot.last_obs.copy()
-            v, w = self.teacher.control(self.sim.robot, self.sim.beam_offsets)
+            try:
+                obs = validate_observation(self.sim.get_observation(), self.dataset.obs_dim)  # fresh copy
+            except ValueError as exc:
+                self._hold_invalid_frame(exc)
+                return
+            action = self.teacher.drive(self.sim, self.sim.robot, dt)
             self._record_accum += dt
             if self._record_accum >= (1.0 / RECORD_HZ):
                 self._record_accum = 0.0
-                self.dataset.add(obs, v, w)
-            self.sim.step_agent(self.sim.robot, v, w, dt, add_noise=True)
+                if not self.sim.robot.collided:  # Same rule as the offline generator: skip crash frames.
+                    self.dataset.add(obs, action)
             if self.sim.robot.reached_goal or self.sim.robot.collided or self.sim.robot.elapsed > 16.0:
                 self._spawn_new_random_map()
                 self.expert_live = True
                 self.recording = True
         else:
-            v, w = self._read_manual_control()
+            action = self._read_manual_action()
             if self.tab == "collect" and self.recording:
+                try:
+                    obs = validate_observation(self.sim.get_observation(), self.dataset.obs_dim)
+                except ValueError as exc:
+                    self._hold_invalid_frame(exc)
+                    return
                 self._record_accum += dt
                 if self._record_accum >= (1.0 / RECORD_HZ):
                     self._record_accum = 0.0
-                    self.dataset.add(self.sim.robot.last_obs, v, w)
-            _, reached, _ = self.sim.step(v, w, dt)
+                    if action is not None:
+                        self.dataset.add(obs, action)
+            _, reached, _ = self.sim.step(action, dt)
             if reached and self.tab == "collect" and self.recording:
                 self._spawn_new_random_map()
                 self.recording = True
@@ -1166,6 +1305,8 @@ class LidarPipelineApp:
             norm = dist / MAX_LIDAR_RANGE
             ex = rx + math.cos(ang) * dist
             ey = ry + math.sin(ang) * dist
+            if not all(math.isfinite(v) for v in (dist, ex, ey)):
+                continue  # a malformed beam (NaN / Inf distance) is not drawn rather than crashing the frame
             col = ACCENT_RED if norm < 0.32 else (ACCENT_YELLOW if norm < 0.62 else ACCENT_GREEN)
             pygame.draw.line(surf, col, (int(rx), int(ry)), (int(ex), int(ey)), 1)
             if dist < MAX_LIDAR_RANGE - 1.5:
@@ -1318,14 +1459,14 @@ class LidarPipelineApp:
                  (x, y + 86), f.small, TEXT_MUTED)
         y += 154
         kit.text("수동 주행", (x, y), f.h2)
-        for i, (key, label) in enumerate((("W A S D", "또는 방향키로 조종"), ("Space", "수동 데이터 수집 시작·중지"))):
+        for i, (key, label) in enumerate((("W A D", "직진·좌회전·우회전 (방향키 가능)"), ("Space", "수동 데이터 수집 시작·중지"))):
             pos = x + i * (w // 2)
             width = kit.keycap(pos, y + 34, key)
             kit.text(label, (pos + width + 8, y + 36), f.small, TEXT_MUTED)
 
     def _render_tab_train(self, x: int, y: int, w: int) -> None:
         kit, f = self.ui, self.fonts
-        busy = self.is_training or self.is_benchmarking
+        busy = self.is_training or self.is_benchmarking or self.infer_switching
         with self.train_lock:
             current = self.train_current_model
             stage = self.train_stage
@@ -1339,7 +1480,7 @@ class LidarPipelineApp:
                    disabled=busy, icon="chart", font=f.h1)
         y += 66
         summary = f"샘플 {len(self.dataset):,}개"
-        if queue and hist and hist.task_type == self.task_type:
+        if queue and hist:
             summary += f"    {len(done)}/{len(queue)}개 학습 완료"
         kit.card(pygame.Rect(x, y, w, 248), "검증 성능 비교", right=summary, right_color=TEXT_MUTED)
         if current:
@@ -1348,13 +1489,12 @@ class LidarPipelineApp:
                 fraction += hist.current_epoch / hist.total_epochs
             kit.progress(pygame.Rect(x + 16, y + 40, w - 32, 4), fraction / max(1, len(queue)), ui.CYAN)
         xs = [x + 32, x + 190, x + 325, x + 435]
-        metric = "정확도 ↑" if self.task_type == "classification" else "검증 MAE ↓"
-        for pos, heading in zip(xs, ("모델", metric, "학습 시간", "추론 시간")):
+        for pos, heading in zip(xs, ("모델", "검증 정확도 ↑", "학습 시간", "추론 시간")):
             kit.text(heading, (pos, y + 51), f.small_b, TEXT_MUTED)
-        best = self._best_model_for_task(self.task_type)
+        best = self._best_model()
         for i, model in enumerate(MODEL_TYPES):
             ry = y + 82 + i * 32
-            tm = self.trained_models.get((model, self.task_type))
+            tm = self.trained_models.get(model)
             pygame.draw.line(self.canvas, ui.BORDER, (x + 16, ry - 7), (x + w - 16, ry - 7))
             pygame.draw.circle(self.canvas, RACE_COLORS[model], (x + 20, ry + 8), 4)
             kit.text(MODEL_LABELS[model], (xs[0], ry), f.body)
@@ -1363,16 +1503,17 @@ class LidarPipelineApp:
             elif current and model in queue and model not in done:
                 kit.text("대기 중", (xs[1], ry), f.body, TEXT_MUTED)
             elif tm:
-                val = f"{tm.val_metric:.1f}%" if self.task_type == "classification" else f"{tm.val_metric:.4f}"
+                val = f"{tm.val_metric:.1f}%"
                 kit.text(val, (xs[1], ry), f.body_b, ui.SUCCESS if tm is best else ui.TEXT)
                 kit.text(f"{tm.train_time:.2f} s", (xs[2], ry), f.body)
                 kit.text(f"{tm.infer_ms:.2f} ms", (xs[3], ry), f.body)
             else:
                 kit.text("미학습", (xs[1], ry), f.body, TEXT_MUTED)
         y += 264
-        kit.segmented(pygame.Rect(x, y, w, 38), [("task_reg", "회귀 · 속도 예측", True),
-                      ("task_cls", "분류 · 행동 예측", True)],
-                      "task_reg" if self.task_type == "regression" else "task_cls", busy=busy)
+        goal_row = pygame.Rect(x, y, w, 38)
+        kit.rrect(goal_row, ui.SURFACE)
+        kit.text("학습 목표 · 좌회전 / 직진 / 우회전 (3클래스 분류)", (goal_row.x + 16, goal_row.centery), f.body,
+                 ui.TEXT_2, anchor="midleft", max_w=goal_row.w - 32)
         y += 46
         for r, model in zip(columns(x, y, w, 34, len(MODEL_TYPES)), MODEL_TYPES):
             kit.model_chip(r, SHORT_MODEL_LABELS[model], f"mtype_{model}", RACE_COLORS[model],
@@ -1389,9 +1530,9 @@ class LidarPipelineApp:
             kit.value_chip(b, "에포크", str(self.epochs), "cycle_epochs", busy)
             a, b = columns(x, y + 38, w, 32, 2)
             kit.toggle(a, "좌우 반전 증강", self.mirror_augment, "toggle_mirror", busy)
-            kit.toggle(b, "클래스 균형", self.class_balance, "toggle_balance", busy or self.task_type == "regression")
+            kit.toggle(b, "클래스 균형", self.class_balance, "toggle_balance", busy)
             y += 80
-        self._render_loss(x, y, w, hist if hist and hist.task_type == self.task_type else None)
+        self._render_loss(x, y, w, hist)
 
     def _render_loss(self, x: int, y: int, w: int, hist: Optional[TrainHistory]) -> None:
         kit, f = self.ui, self.fonts
@@ -1423,7 +1564,8 @@ class LidarPipelineApp:
         running = self.race_running if race else self.single_running
         label = ("동시 레이스" if race else "단일 주행") + (" 중지" if running else " 시작")
         kit.button(pygame.Rect(x, y, w, 52), label, "toggle_test", variant="primary",
-                   icon="stop" if running else "play", font=f.h1)
+                   icon="stop" if running else "play", font=f.h1,
+                   disabled=not running and self.test_start_blocked)
         y += 62
         kit.segmented(pygame.Rect(x, y, w, 38),
                       [("mode_race", "동시 레이스", True), ("mode_single", "단일 주행", True)],
@@ -1461,13 +1603,14 @@ class LidarPipelineApp:
         kit.text("추론 장치", (x, y + 10), f.small_b)
         kit.segmented(pygame.Rect(x + 76, y, w - 76, 36),
                       [(f"infer_{key}", name, available) for key, name, available in acc_choices],
-                      f"infer_{self.infer_backend}", busy=self.is_compiling_hw or self.is_training or self.is_benchmarking)
+                      f"infer_{self.infer_backend}", busy=self.infer_switching or self.is_training or self.is_benchmarking)
         y += 54
         kit.card(pygame.Rect(x, y, w, LOGICAL_HEIGHT - 84 - y), "20맵 평가", right="목적지 도달률")
         left, right = columns(x + 16, y + 41, w - 32, 36, 2)
         completed, total, _ = self.bench_progress
         label = f"평가 중  {completed}/{total}" if self.is_benchmarking else "20맵 평가 실행"
-        kit.button(left, label, "run_bench", disabled=self.is_benchmarking or self.is_training, icon="flag")
+        kit.button(left, label, "run_bench", disabled=self.is_benchmarking or self.is_training or self.infer_switching,
+                   icon="flag")
         kit.button(right, "CSV 저장", "export_bench", disabled=not self.bench_results or self.is_benchmarking, icon="save")
         if not self.bench_results:
             kit.text("같은 랜덤 맵 20개에서 각 모델의 도착·충돌 횟수를 비교합니다.",
@@ -1485,22 +1628,19 @@ class LidarPipelineApp:
         keys = ("baseline", *MODEL_TYPES)
         for r, key in zip(columns(x, y, w, 34, len(keys)), keys):
             kit.model_chip(r, RACE_TAGS[key], f"pick_single_{key}", RACE_COLORS[key], self.single_model_key == key,
-                           disabled=key != "baseline" and (key, self.task_type) not in self.trained_models)
+                           disabled=key != "baseline" and key not in self.trained_models)
         y += 44
-        kit.card(pygame.Rect(x, y, w, 178), "주행 예측값", right=RACE_TAGS[self.single_model_key])
+        tag = RACE_TAGS[self.single_model_key]
+        caption = "규칙 출력" if self.single_model_key == "baseline" else "행동 확률"
+        kit.card(pygame.Rect(x, y, w, 178), "주행 예측값", right=f"{tag} · {caption}")
         info = self.last_pred_info
-        if info.get("task") == "classification":
+        if "probs" in info:
+            chosen = int(info["action"])  # type: ignore[call-overload]
             for i, (name, p, color) in enumerate(zip(ACTION_NAMES, info["probs"], (ui.CYAN, ui.SUCCESS, ui.VIOLET))):
                 ry = y + 50 + 36 * i
-                kit.text(name, (x + 16, ry), f.body)
+                kit.text(name, (x + 16, ry), f.body_b if i == chosen else f.body, ui.TEXT if i == chosen else TEXT_MUTED)
                 kit.progress(pygame.Rect(x + 88, ry + 4, w - 178, 12), float(p), color)
                 kit.text(f"{p:.1%}", (x + w - 16, ry), f.body, anchor="topright")
-        elif info.get("task") == "regression":
-            for i, (key, name, color) in enumerate((("v_norm", "선속도", ui.SUCCESS), ("w_norm", "각속도", ui.CYAN))):
-                ry = y + 50 + 54 * i
-                value = float(info[key])
-                kit.text(f"{name}  {value:+.2f}", (x + 16, ry), f.body)
-                kit.gauge(pygame.Rect(x + 16, ry + 28, w - 32, 10), value, color)
         else:
             kit.text("단일 주행을 시작하면 선택한 모델의 출력이 표시됩니다.",
                      (x + 16, y + 72), f.body, TEXT_MUTED)
@@ -1512,16 +1652,13 @@ class LidarPipelineApp:
             row = pygame.Rect(x, y + i * 44, w, 38)
             kit.button(row, label, f"viz_chart_{key}", active=key == self.viz_chart, disabled=busy,
                        accent=ui.CYAN, align_left=True)
-        y += 288
+        y += 244
         if self.viz_chart == "pca3d":
-            kit.card(pygame.Rect(x, y, w, 154), "3D 시점",
+            kit.card(pygame.Rect(x, y, w, 98), "3D 시점",
                      right=f"드래그 회전   고도 {self.viz_elev:.0f}° / 방위 {self.viz_azim:.0f}°")
             options = (("왼쪽", "left"), ("오른쪽", "right"), ("위", "up"), ("아래", "down"))
             for r, (label, key) in zip(columns(x + 16, y + 44, w - 32, 34, 4), options):
                 kit.button(r, label, f"viz_rot_{key}", disabled=busy)
-            color_label = "연속 조향각" if self.viz_color_continuous else "행동 클래스"
-            kit.value_chip(pygame.Rect(x + 16, y + 92, w - 32, 42), "점 색상 기준", color_label,
-                           "viz_toggle_color", disabled=busy)
         elif self.viz_chart != "summary":
             choices = self._viz_model_choices()
             kit.card(pygame.Rect(x, y, w, 98), "분석 모델")
@@ -1533,7 +1670,7 @@ class LidarPipelineApp:
         kit.text("PNG   160 DPI", (x + w, y + 3), f.small_b, TEXT_MUTED, anchor="topright")
         left, right = columns(x, y + 38, w, 44, 2)
         kit.button(left, "현재 그래프 PNG 저장", "viz_save_one", variant="primary", icon="image", disabled=busy)
-        kit.button(right, "전체 6종 PNG 저장", "viz_save_all", icon="save", disabled=busy)
+        kit.button(right, f"전체 {len(CHART_CHOICES)}종 PNG 저장", "viz_save_all", icon="save", disabled=busy)
         kit.button(pygame.Rect(x, y + 94, w, 36), "최신 데이터로 새로고침", "viz_refresh",
                    variant="ghost", icon="refresh", disabled=busy)
 

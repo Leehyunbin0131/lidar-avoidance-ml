@@ -1,4 +1,4 @@
-"""Render the Korean guide's three deterministic animations from simulator and checkpoint data."""
+"""Render the Korean guide's classification figures from simulator and checkpoint data."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -18,9 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from expert import AStarTeacher
-from model import MODEL_LABELS, checkpoint_path_for, load_checkpoint, predict_command
+from model import MODEL_LABELS, load_checkpoint_with_fallback, predict_action
 from simulator import (
-    GOAL_RADIUS, MAX_ANGULAR_SPEED, MAX_LIDAR_RANGE, NUM_BEAMS, ROBOT_RADIUS,
+    ACTION_LEFT, ACTION_NAMES, ACTION_RIGHT, ACTION_STRAIGHT, FOV_RAD, GOAL_RADIUS,
+    MAX_LIDAR_RANGE, NUM_ACTIONS, NUM_BEAMS, ROBOT_RADIUS,
     WALL_MARGIN, WORLD_HEIGHT, WORLD_WIDTH, CircleObstacle, MapConfig, RectObstacle, Simulator,
 )
 from ui_kit import (
@@ -31,6 +33,9 @@ from ui_kit import (
 
 MODELS_DIR = ROOT / "models"
 FIGURES = ROOT / "docs" / "figures"
+DATASET = ROOT / "data" / "dataset.npz"
+MODEL_ORDER = ("cnn1d", "mlp", "rf", "knn", "linear")
+LATENCY_STEPS = 6
 SCENE = MapConfig(
     "가이드 장면", "가이드", spawn=(140.0, 480.0, 0.0), goal=(940.0, 480.0),
     rects=[RectObstacle(470, 250, 60, 460)],
@@ -146,73 +151,109 @@ class Sample:
     front: float
     scan: np.ndarray
     endpoints: list
-    wanted: float
-    applied: float
+    action: int
+    applied_action: Optional[int]
     lookahead: tuple | None
     goal: bool
     crash: bool
 
 
 def drive(sim, teacher=None, model=None, delay=0):
-    robot = sim.spawn_robot_state()
-    queue = deque([(0.0, 0.0)] * delay)
+    sim.reset_robot()
+    robot = sim.robot
+    queue: deque[Optional[int]] = deque([None] * delay)
     history = []
     for step in range(901):
-        if teacher is None:
-            v, w, _ = predict_command(model, robot.last_obs)
+        xy = (robot.x, robot.y)
+        theta = robot.theta
+        obs = sim.get_observation()
+        front = float(obs[9:16].min())
+        scan = robot.last_distances.copy()
+        angles = theta + sim.beam_offsets
+        ends = np.column_stack((xy[0] + np.cos(angles)*scan, xy[1] + np.sin(angles)*scan))
+        goal, crash = robot.reached_goal, robot.collided
+        if goal or crash or step == 900:
+            # Keep displaying the last actions issued when the run stops.
+            action, applied = history[-1].action, history[-1].applied_action
+        elif teacher is not None:
+            action = applied = teacher.drive(sim, sim.robot, DT, add_noise=False)
         else:
-            v, w = teacher.control(robot, sim.beam_offsets)
-        queue.append((v, w))
-        applied_v, applied_w = queue.popleft()
-        angles = robot.theta + sim.beam_offsets
-        ends = np.column_stack((robot.x + np.cos(angles)*robot.last_distances,
-                                robot.y + np.sin(angles)*robot.last_distances))
+            action = predict_action(model, obs)[0]
+            queue.append(action)
+            applied = queue.popleft()
+            sim.step_action(sim.robot, applied, DT, add_noise=False)
         history.append(Sample(
-            (robot.x, robot.y), robot.theta, step*DT, float(robot.last_obs[9:16].min()),
-            robot.last_distances.copy(), ends.tolist(), w/MAX_ANGULAR_SPEED, applied_w/MAX_ANGULAR_SPEED,
-            teacher.lookahead_point if teacher else None, robot.reached_goal, robot.collided,
+            xy, theta, step*DT, front, scan, ends.tolist(), action, applied,
+            teacher.lookahead_point if teacher else None, goal, crash,
         ))
-        if robot.reached_goal or robot.collided:
-            # The terminal pose has no next command. Display the last pair actually issued.
-            history[-1].wanted, history[-1].applied = history[-2].wanted, history[-2].applied
+        if goal or crash:
             break
-        sim.step_agent(robot, applied_v, applied_w, dt=DT, add_noise=False)
     return history
 
 
-def scenarios():
+def load_model(key):
+    """Load ``key`` like the app does: canonical ``goal_{key}.*`` first, then the legacy ``_cls`` sibling.
+
+    Both candidates must hold exactly ``key`` and pass the 28-feature dry-run probe; raises FileNotFoundError
+    (listing every rejected file) when neither loads.
+    """
+    model, errors = load_checkpoint_with_fallback(MODELS_DIR, key)
+    if model is None:
+        detail = f" ({'; '.join(errors)})" if errors else ""
+        raise FileNotFoundError(f"No loadable classification checkpoint for {key} in {MODELS_DIR}{detail}")
+    for error in errors:
+        print(f"Checkpoint fallback for {key}: {error}")
+    return model
+
+
+def candidate_runs(sim):
+    for key in MODEL_ORDER:
+        try:
+            model = load_model(key)
+        except FileNotFoundError as exc:
+            print(f"Skipping {key}: {exc}")
+            continue
+        yield key, model, drive(sim, model=model)
+
+
+def astar_scenario():
     sim = Simulator(noise_std=0.0)
     sim.set_map_config(SCENE)
     teacher = AStarTeacher()
     path = teacher.plan(SCENE)
     astar = drive(sim, teacher=teacher)
-    assert astar[-1].goal, "A* failed to reach the goal"
-    for key, task in (("cnn1d", "regression"), ("mlp", "regression"),
-                      ("cnn1d", "classification"), ("mlp", "classification")):
-        ckpt = checkpoint_path_for(MODELS_DIR, key, task)
-        if ckpt.exists():
-            model = load_checkpoint(ckpt)
-            direct = drive(sim, model=model)
-            if direct[-1].goal:
-                break
-    else:
-        raise AssertionError("No candidate checkpoint reached the goal")
-    delayed = drive(sim, model=model, delay=6)
-    dataset = ROOT / "data" / "dataset.npz"
-    if dataset.exists():
-        with np.load(dataset) as data:
-            p2 = float(np.percentile(data["obs"][:, 9:16].min(axis=1), 2))
-    else:
-        p2 = 0.30
-    direct_min = min(s.front for s in direct)
-    delay_min = min(s.front for s in delayed[:-1])
-    assert direct[-1].goal and direct_min >= p2, (direct_min, p2)
-    assert delayed[-1].crash and delay_min < p2, (delay_min, p2)
-    first_rare = next(s for s in delayed[:-1] if s.front < p2)
-    print(f"A* GOAL {astar[-1].elapsed:.3f}s; {key}/{task} GOAL {direct[-1].elapsed:.3f}s "
-          f"(min front {direct_min:.6f} >= P2 {p2:.6f}); 6-step delay CRASH {delayed[-1].elapsed:.3f}s "
-          f"(front first below P2 at {first_rare.elapsed:.3f}s, pre-crash min {delay_min:.6f})")
-    return path, astar, key, direct, delayed, p2
+    if not astar[-1].goal:
+        raise RuntimeError("A* failed to reach the guide scene goal")
+    for key, _, direct in candidate_runs(sim):
+        if direct[-1].goal:
+            print(f"A* vs model: A* GOAL {astar[-1].elapsed:.3f}s; "
+                  f"{key} GOAL {direct[-1].elapsed:.3f}s")
+            return path, astar, key, direct
+    raise RuntimeError("No classification checkpoint reached the A* comparison goal")
+
+
+def latency_scenario():
+    sim = Simulator(noise_std=0.0)
+    sim.set_map_config(SCENE)
+    with np.load(DATASET) as data:
+        p2 = float(np.percentile(data["obs"][:, 9:16].min(axis=1), 2))
+    for key, model, direct in candidate_runs(sim):
+        direct_min = min(sample.front for sample in direct)
+        if not direct[-1].goal or direct_min < p2:
+            continue
+        delayed = drive(sim, model=model, delay=LATENCY_STEPS)
+        delayed_min = min(sample.front for sample in delayed)
+        if delayed[-1].crash and delayed_min < p2:
+            first_rare = next(sample for sample in delayed if sample.front < p2)
+            print(f"Latency: {key}, {LATENCY_STEPS} steps ({LATENCY_STEPS*DT:.3f}s), P2 {p2:.6f}; "
+                  f"direct GOAL {direct[-1].elapsed:.3f}s (min front {direct_min:.6f}); "
+                  f"delayed CRASH {delayed[-1].elapsed:.3f}s (min front {delayed_min:.6f}, "
+                  f"first below P2 at {first_rare.elapsed:.3f}s)")
+            return key, direct, delayed, p2
+    raise RuntimeError(
+        f"No classification checkpoint reached the goal at or above P2={p2:.6f} without delay "
+        f"and crashed below P2 with a {LATENCY_STEPS}-step delay"
+    )
 
 
 def world(point):
@@ -281,12 +322,15 @@ def robot_and_goal(c, run, step, rim):
     c.line([(x, y), (x+radius*math.cos(s.theta), y+radius*math.sin(s.theta))], rim, 2)
 
 
-def gauge(c, x, y, width, value, accent):
-    mid = x + width/2
-    tip = mid + value*width/2
-    c.box((x, y-3, x+width, y+3), SURFACE_3, radius=2)
-    c.box((min(mid, tip), y-3, max(mid, tip), y+3), accent, radius=1)
-    c.line([(mid, y-5), (mid, y+5)], TEXT_2)
+def action_indicator(c, x, y, selected, accent=CYAN):
+    width, height = 61, 28
+    c.box((x, y, x+width*NUM_ACTIONS, y+height), SURFACE, BORDER, 7)
+    for action, label in enumerate(ACTION_NAMES):
+        left = x + width*action
+        if action == selected:
+            c.box((left, y, left+width, y+height), tint(accent, .16, SURFACE), accent, 7)
+        c.text((left+width/2, y+height/2), label, 14,
+               accent if action == selected else TEXT_2, action == selected, "mm")
 
 
 def phase(c, x, label, t, accent):
@@ -301,6 +345,8 @@ def astar_gif(path, astar, key, direct):
     ghosts = deque(maxlen=6)
     right_phase = 0
     right_labels = ("① 목적지까지 직선으로 출발", "② 벽 감지 → 학습한 방식으로 회피", "③ 다시 목적지 방향으로")
+    wall = SCENE.rects[0]
+    wall_exit = wall.x + wall.w
     last_step = max(len(astar), len(direct))-1
     steps = [0]*8 + list(range(3, last_step, 3)) + [last_step]
     for i, step in enumerate(steps):
@@ -339,11 +385,7 @@ def astar_gif(path, astar, key, direct):
         if i % 10 == 0:
             ghosts.append(origin)
         robot_and_goal(right, direct, right_idx, TEXT)
-        right.box((19, 19, 175, 65), SURFACE, BORDER, 8)
-        right.text((31, 32), "회전 명령", 13, TEXT, True)
-        right.text((31, 51), "좌", 12, TEXT_2)
-        right.text((163, 51), "우", 12, TEXT_2, anchor="rm")
-        gauge(right, 49, 51, 96, s.wanted, CYAN)
+        action_indicator(right, 19, 19, s.action)
         if s.goal:
             chip(right, (365, 19), f"도착 {s.elapsed:.1f}초", SUCCESS)
         frame.image.paste(right.image, scaled((508, 64)), map_mask())
@@ -352,7 +394,8 @@ def astar_gif(path, astar, key, direct):
         for observation in direct[max(0, right_idx-2):right_idx+1]:
             if right_phase == 0 and observation.front < .9:
                 right_phase = 1
-            elif right_phase == 1 and observation.front >= .9 and abs(observation.wanted) <= .3:
+            elif (right_phase == 1 and observation.xy[0] >= wall_exit
+                  and observation.front >= .9 and observation.action == ACTION_STRAIGHT):
                 right_phase = 2
         left_label = "① 지도 전체로 경로 계산 (A*)" if i < 8 else "② 계산한 경로를 따라 주행"
         phase(frame, 0, f"도착 · {a.elapsed:.1f}초" if a.goal else left_label, a.elapsed, PATH)
@@ -373,18 +416,20 @@ def latency_panel(run, idx, p2, delayed):
     if s.front < p2:
         c.dot(origin, 14, edge=DANGER, width=6)
         chip(c, (19, MAP_H-49), "학습 데이터에 드문 거리", DANGER)
-    c.box((19, 19, 254, 73), SURFACE, BORDER, 8)
-    for y, label, value in ((35, "모델이 방금 낸 명령", s.wanted), (57, "바퀴가 실행 중인 명령", s.applied)):
-        c.text((29, y), label, 12, TEXT_2)
-        gauge(c, 151, y, 90, value, WARNING if delayed else CYAN)
+    accent = WARNING if delayed else CYAN
+    chip(c, (19, 19), f"희망 행동  {ACTION_NAMES[s.action]}", accent)
+    applied = "대기" if s.applied_action is None else ACTION_NAMES[s.applied_action]
+    chip(c, (19, 53), f"적용 행동  {applied}", TEXT_2 if s.applied_action is None else accent)
     if s.crash:
         chip(c, (344, 19), f"충돌 · {s.elapsed:.1f}초", DANGER, 16)
+    elif s.goal:
+        chip(c, (344, 19), f"도착 · {s.elapsed:.1f}초", SUCCESS, 16)
     elif s.xy[0] > 560:
         chip(c, (378, 19), "벽 통과", SUCCESS, 15)
     return c
 
 
-def sparkline(frame, x, run, idx, p2):
+def sparkline(frame, x, run, idx, p2, last_step):
     frame.text((x+3, 496), "전방 빔 최솟값", 12, CYAN, True)
     frame.text((x+104, 496), f"학습 하위 2%  {p2:.3f}", 12, DANGER)
     frame.text((x+PANEL-4, 496), f"t {run[idx].elapsed:.1f}초", 12, TEXT_2, anchor="rm")
@@ -394,39 +439,47 @@ def sparkline(frame, x, run, idx, p2):
     frame.box((x, top, x+PANEL-1, bottom), SURFACE)
     frame.box((x, y(p2), x+PANEL-1, bottom), blend(BG_WORLD, DANGER, .18))
     frame.dash((x, y(p2)), (x+PANEL-1, y(p2)), DANGER, dash=5, gap=4)
-    pts = [(x+i*(PANEL-4)/150+1, y(row.front)) for i, row in enumerate(run[:idx+1])]
+    pts = [(x+i*(PANEL-4)/last_step+1, y(row.front)) for i, row in enumerate(run[:idx+1])]
     frame.line(pts, CYAN, 2)
     frame.dot(pts[-1], 1.5, CYAN)
 
 
-def latency_gif(direct, delayed, p2):
+def latency_gif(key, direct, delayed, p2):
     frames = []
-    for step in range(0, 151, 3):
-        frame = two_panels([("지연 없음", "명령을 바로 바퀴에 적용", TEXT_2),
-                            ("명령 0.2초 지연", "6스텝 전 명령을 바퀴에 적용", WARNING)])
+    last_step = max(len(direct), len(delayed))-1
+    for step in [*range(0, last_step, 3), last_step]:
+        frame = two_panels([
+            ("지연 없음", f"{MODEL_LABELS[key]} · 행동을 바로 적용", TEXT_2),
+            (f"행동 {LATENCY_STEPS*DT:.1f}초 지연", f"{MODEL_LABELS[key]} · {LATENCY_STEPS}스텝 전 행동 적용", WARNING),
+        ])
         for x, run in ((0, direct), (508, delayed)):
             idx = min(step, len(run)-1)
             panel = latency_panel(run, idx, p2, delayed=x != 0)
             frame.image.paste(panel.image, scaled((x, 64)), map_mask())
-            sparkline(frame, x, run, idx, p2)
+            sparkline(frame, x, run, idx, p2, last_step)
         frames.append(frame.final())
     save_gif(frames, [100]*(len(frames)-1)+[2500], FIGURES/"closed-loop-latency.gif")
 
 
 def linear_diagram(c, coef, active):
     color = MODEL_COLORS["linear"]
-    c.text((11, 66), "회전 명령 가중치", 13, TEXT_2, True)
+    right, left = "우회전−좌회전 점수 가중치".split("−")
+    c.text((11, 66), right, 13, TEXT_2, True)
+    minus_x = 11 + font(13, True).getlength(right)/SS
+    # The preferred Korean font can lack the mathematical minus glyph.
+    c.line([(minus_x+1, 66), (minus_x+7, 66)], TEXT_2)
+    c.text((minus_x+8, 66), left, 13, TEXT_2, True)
     baseline = 166
     c.line([(11, baseline), (177, baseline)], TEXT_3)
     scale = 65 / np.abs(coef).max()
     for i, weight in enumerate(coef):
-        x = 13+i*6.5
+        x = 13+i*5.9
         tip = baseline-scale*weight
-        c.box((x, min(baseline, tip), x+4.5, max(baseline, tip)), color,
+        c.box((x, min(baseline, tip), x+4, max(baseline, tip)), color,
               CYAN if i in active else None)
     c.text((12, 88), "+", 12, TEXT_3)
     c.line([(12, 243), (19, 243)], TEXT_3)
-    c.text((94, 261), "표준화된 입력의 계수", 12, TEXT_2, anchor="mm")
+    c.text((94, 261), "빔 25개 · 목표 입력 3개", 12, TEXT_2, anchor="mm")
 
 
 def knn_diagram(c, points, shift):
@@ -480,7 +533,7 @@ def mlp_diagram(c, active):
     c.text((11, 66), "입력 → 은닉층 → 출력", 13, TEXT_2, True)
     inputs = [(22, y) for y in np.linspace(89, 238, 28)]
     hidden = [(95, y) for y in np.linspace(98, 229, 8)]
-    outputs = [(164, 140), (164, 186)]
+    outputs = [(164, y) for y in np.linspace(121, 205, NUM_ACTIONS)]
     for p in inputs:
         for h in hidden:
             c.line([p, h], tint(color, .13), .5)
@@ -495,7 +548,7 @@ def mlp_diagram(c, active):
         c.dot(p, 1.8, CYAN if i in active else TEXT_3)
     for p in outputs:
         c.dot(p, 4.5, color)
-    for x, label in ((22, "28"), (95, "8"), (164, "2")):
+    for x, label in ((22, "28"), (95, "은닉층"), (164, str(NUM_ACTIONS))):
         c.text((x, 261), label, 12, TEXT_2, anchor="mm")
 
 
@@ -521,11 +574,31 @@ def cnn_diagram(c, scan, response, peak, center, channel):
 
 CARDS = [
     ("linear", "Linear", True, ("빔마다 고정된 가중치 · 입구가", "옮겨지면 다른 가중치와 곱해짐")),
-    ("knn", "KNN", False, ("가장 비슷한 기록 7개의", "명령을 거리로 가중 평균")),
+    ("knn", "KNN", False, ("가장 비슷한 기록 7개의", "행동에 거리 가중 투표")),
     ("rf", "RandomForest", True, ("60개 트리가 각자 특정 빔의", "기준값으로 질문")),
     ("mlp", "MLP", False, ("모든 입력이 모든 은닉 뉴런과", "연결 · 이웃 관계도 데이터로 학습")),
     ("cnn1d", "1D CNN", True, ("같은 필터가 모든 위치에 적용 ·", "입구가 옮겨지면 반응도 같이 이동")),
 ]
+
+
+def linear_class_coefficients(est) -> np.ndarray:
+    """Per-action weight rows (NUM_ACTIONS, n_features) of a fitted LogisticRegression, indexed by action ID.
+
+    ``est`` may be the bare classifier or a Pipeline whose final step is one (any step names). Rows are placed by
+    ``clf.classes_``. A binary model's single ``coef_`` row scores ``classes_[1]`` against ``classes_[0]``,
+    so it becomes ``+coef_[0]`` / ``-coef_[0]`` for those two actions; an action the model never saw gets zeros.
+    """
+    clf = est.steps[-1][1] if hasattr(est, "steps") and est.steps else est
+    coef = np.asarray(clf.coef_, dtype=np.float64)
+    classes = [int(c) for c in clf.classes_]
+    rows = np.zeros((NUM_ACTIONS, coef.shape[1]), dtype=np.float64)
+    if len(classes) == 2 and coef.shape[0] == 1:
+        rows[classes[0]] = -coef[0]
+        rows[classes[1]] = coef[0]
+    else:
+        for row, cls in zip(coef, classes):
+            rows[cls] = row
+    return rows
 
 
 def models_gif():
@@ -533,13 +606,16 @@ def models_gif():
     for shift, scan in enumerate(scans):
         scan[14+shift:19+shift] = 1.
     def estimator(key):
-        return load_checkpoint(checkpoint_path_for(MODELS_DIR, key, "regression")).estimator
-    coef = estimator("linear").named_steps["reg"].coef_[1][:NUM_BEAMS]
+        return load_model(key).estimator
+
+    weights = linear_class_coefficients(estimator("linear"))
+    coef = weights[ACTION_RIGHT] - weights[ACTION_LEFT]
     tree = estimator("rf").estimators_[0].tree_
     with torch.inference_mode():
         responses = torch.relu(estimator("cnn1d").conv[0](torch.from_numpy(scans).unsqueeze(1))).numpy()
     channel = responses[0].max(axis=1).argmax()
     profiles = responses[:, channel, :]
+    print(f"CNN first-layer peak filter: index {channel} (0-based, figure label {channel+1})")
     points = np.random.default_rng(0).uniform([15, 91], [173, 235], (40, 2))
     frames, durations = [], []
     for shift, scan in enumerate(scans):
@@ -585,22 +661,71 @@ def models_gif():
     save_gif(frames, durations, FIGURES/"five-models-shift.gif")
 
 
+def observation_png():
+    with np.load(DATASET) as data:
+        observations = data["obs"]
+        actions = data["actions"]
+    center = NUM_BEAMS // 2
+    left_medians = np.median(observations[:, :center], axis=1)
+    right_minima = observations[:, center+1:NUM_BEAMS].min(axis=1)
+    # A majority of left beams must be short and every right beam near full range.
+    matches = np.flatnonzero((actions == ACTION_RIGHT) & (left_medians <= .40) & (right_minima >= .90))
+    if not matches.size:
+        raise RuntimeError("No recorded right turn has a left median ≤ 0.40 and a right minimum ≥ 0.90")
+    index = matches[0]
+    obs = observations[index]
+    scan = obs[:NUM_BEAMS]
+    action = int(actions[index])
+    goal_sin, goal_cos, goal_distance = obs[NUM_BEAMS:]
+    goal_angle = math.degrees(math.atan2(goal_sin, goal_cos))
+    direction = "왼쪽" if goal_angle < 0 else "오른쪽"
+    print(f"Recorded observation: sample {index+1}, action {ACTION_NAMES[action]}; "
+          f"left min {scan[:center].min():.6f}, left median {left_medians[index]:.6f}; "
+          f"right min {right_minima[index]:.6f}, right median {np.median(scan[center+1:]):.6f}")
+
+    c = Canvas(960, 324)
+    c.box((10, 10, 500, 314), SURFACE, radius=14)
+    c.text((28, 36), "관측 / 로봇의 앞쪽 180°", 20, CYAN, True)
+    origin = (245, 246)
+    for angle, distance in zip(np.linspace(-FOV_RAD/2, FOV_RAD/2, NUM_BEAMS), scan):
+        r = 181 * distance
+        endpoint = (origin[0] + r*math.sin(angle), origin[1] - r*math.cos(angle))
+        c.line([origin, endpoint], CYAN)
+        if distance < .98:
+            c.dot(endpoint, 3, WARNING)
+    c.draw.polygon([scaled(p) for p in [(245, 234), (235, 252), (255, 252)]], fill=TEXT)
+    c.text((28, 282), "왼쪽", 16, TEXT_2)
+    c.text((470, 282), "오른쪽", 16, TEXT_2, anchor="rm")
+    c.line([(514, 162), (548, 162)], TEXT_2, 2)
+    c.draw.polygon([scaled(p) for p in [(541, 155), (551, 162), (541, 169)]], fill=TEXT_2)
+    c.text((571, 36), "같은 순간에 기록한 행동", 20, WARNING, True)
+    c.text((570, 98), ACTION_NAMES[action], 38, TEXT, True)
+    action_indicator(c, 571, 139, action, WARNING)
+    c.text((571, 203), f"목표 방향  {direction} {abs(goal_angle):.1f}°", 18, TEXT_2)
+    c.text((571, 230), f"목표 거리 (정규화)  {goal_distance:.3f}", 16, TEXT_2)
+    c.text((571, 281), f"저장 데이터의 {index+1}번째 샘플", 16, TEXT_2)
+    path = FIGURES / "recorded-observation.png"
+    result = c.final()
+    result.save(path)
+    print(f"{path.name}: {result.width}×{result.height}, {path.stat().st_size / 1000:.3f} KB")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--only", choices=("astar", "models", "latency"))
+    parser.add_argument("--only", choices=("astar", "models", "latency", "observation"))
     args = parser.parse_args()
     np.random.seed(0)
     torch.manual_seed(0)
     torch.set_num_threads(1)
     FIGURES.mkdir(exist_ok=True)
-    if args.only != "models":
-        path, astar, key, direct, delayed, p2 = scenarios()
-        if args.only != "latency":
-            astar_gif(path, astar, key, direct)
-        if args.only != "astar":
-            latency_gif(direct, delayed, p2)
+    if args.only in (None, "astar"):
+        astar_gif(*astar_scenario())
+    if args.only in (None, "latency"):
+        latency_gif(*latency_scenario())
     if args.only in (None, "models"):
         models_gif()
+    if args.only in (None, "observation"):
+        observation_png()
 
 
 if __name__ == "__main__":

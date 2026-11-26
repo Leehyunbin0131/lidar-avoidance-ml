@@ -610,14 +610,3 @@ class UIKit:
         self.rrect(r, BORDER_STRONG, 6, 1)
         self.text(s, r.center, f, TEXT, anchor="center")
         return w
-
-    def gauge(self, rect: pygame.Rect, val: float, color: Color) -> None:
-        """Bipolar gauge centered at 0 for values in [-1, 1]."""
-        self.rrect(rect, INSET, rect.h // 2)
-        mid = rect.x + rect.w // 2
-        v = max(-1.0, min(1.0, val))
-        bw = int((rect.w // 2 - 2) * abs(v))
-        if bw > 0:
-            x = mid if v >= 0 else mid - bw
-            self.rrect(pygame.Rect(x, rect.y + 2, bw, rect.h - 4), color, (rect.h - 4) // 2)
-        pygame.draw.line(self.canvas, BORDER_STRONG, (mid, rect.y - 3), (mid, rect.bottom + 2), 2)
